@@ -1,3 +1,22 @@
+diff --git a/livekit/src/room/mod.rs b/livekit/src/room/mod.rs
+index b02d88e..c00819f 100644
+--- a/livekit/src/room/mod.rs
++++ b/livekit/src/room/mod.rs
+@@ -767,11 +767,13 @@ impl Room {
+ 
+         e2ee_manager.on_state_changed({
+             let dispatcher = dispatcher.clone();
+-            let inner = inner.clone();
++            let weak_inner = Arc::downgrade(&inner);
+             move |participant_identity, state| {
+                 // Forward e2ee events to the room
+                 // (Ignore if the participant is not in the room anymore)
+ 
++                let Some(inner) = weak_inner.upgrade() else { return };
++
+                 let participant = if participant_identity.as_str()
+                     == inner.local_participant.identity().as_str()
+                 {
 diff --git a/livekit/src/rtc_engine/rtc_events.rs b/livekit/src/rtc_engine/rtc_events.rs
 index a59aab5..7b51092 100644
 --- a/livekit/src/rtc_engine/rtc_events.rs

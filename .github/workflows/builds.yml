@@ -144,10 +144,9 @@ jobs:
 
       # ---------- Cache Cargo ----------
       # The Rust FFI is built from the pinned client-sdk-rust submodule. Its
-      # compiled output only changes when the submodule commit changes, so we
-      # key the target cache on the submodule SHA (not Cargo.lock, which is
-      # pinned inside the submodule and effectively immutable -- that froze the
-      # old cache permanently). Resolve it once here for the restore/save steps.
+      # compiled output changes when either the pinned submodule or a fork patch
+      # changes, so both identities belong in the target cache key. Resolve the
+      # submodule SHA once here for the restore/save steps.
       - name: Resolve Rust submodule SHA
         id: rust_sha
         shell: bash
@@ -174,13 +173,13 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: client-sdk-rust/target/
-          key: ${{ matrix.os }}-${{ matrix.name }}-cargo-target-${{ steps.rust_sha.outputs.sha }}
+          key: ${{ matrix.os }}-${{ matrix.name }}-cargo-target-${{ steps.rust_sha.outputs.sha }}-${{ hashFiles('patches/client-sdk-rust/*.patch') }}
           restore-keys: |
             ${{ matrix.os }}-${{ matrix.name }}-cargo-target-
 
       # restore-keys can hydrate target/ from a prior submodule SHA. cxxbridge
       # artifacts in webrtc-sys are not compatible across those bumps.
-      - name: Drop stale cargo target on submodule SHA cache miss
+      - name: Drop stale cargo target on source identity cache miss
         if: steps.cache-cargo-target.outputs.cache-hit != 'true'
         shell: bash
         run: rm -rf client-sdk-rust/target/
@@ -216,7 +215,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: client-sdk-rust/target/
-          key: ${{ matrix.os }}-${{ matrix.name }}-cargo-target-${{ steps.rust_sha.outputs.sha }}
+          key: ${{ matrix.os }}-${{ matrix.name }}-cargo-target-${{ steps.rust_sha.outputs.sha }}-${{ hashFiles('patches/client-sdk-rust/*.patch') }}
 
       - name: Save vcpkg binary cache
         if: runner.os == 'Windows' && steps.cache-vcpkg-binary.outputs.cache-hit != 'true'

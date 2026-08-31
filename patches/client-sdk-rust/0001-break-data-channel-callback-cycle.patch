@@ -1,0 +1,44 @@
+diff --git a/livekit/src/rtc_engine/rtc_events.rs b/livekit/src/rtc_engine/rtc_events.rs
+index a59aab5..2f052a0 100644
+--- a/livekit/src/rtc_engine/rtc_events.rs
++++ b/livekit/src/rtc_engine/rtc_events.rs
+@@ -60,7 +60,6 @@ pub enum RtcEvent {
+     },
+     DataChannelBufferedAmountChange {
+         sent: u64,
+-        amount: u64,
+         kind: DataPacketKind,
+     },
+ }
+@@ -166,16 +165,14 @@ fn on_message(emitter: RtcEmitter, kind: DataPacketKind) -> rtc::data_channel::O
+ 
+ fn on_buffered_amount_change(
+     emitter: RtcEmitter,
+-    dc: DataChannel,
+     kind: DataPacketKind,
+ ) -> rtc::data_channel::OnBufferedAmountChange {
+     Box::new(move |sent| {
+-        let amount = dc.buffered_amount();
+-        let _ = emitter.send(RtcEvent::DataChannelBufferedAmountChange { sent, amount, kind });
++        let _ = emitter.send(RtcEvent::DataChannelBufferedAmountChange { sent, kind });
+     })
+ }
+ 
+ pub fn forward_dc_events(dc: &mut DataChannel, kind: DataPacketKind, rtc_emitter: RtcEmitter) {
+     dc.on_message(Some(on_message(rtc_emitter.clone(), kind)));
+-    dc.on_buffered_amount_change(Some(on_buffered_amount_change(rtc_emitter, dc.clone(), kind)));
++    dc.on_buffered_amount_change(Some(on_buffered_amount_change(rtc_emitter, kind)));
+ }
+diff --git a/livekit/src/rtc_engine/rtc_session.rs b/livekit/src/rtc_engine/rtc_session.rs
+index bb6c45f..88b1976 100644
+--- a/livekit/src/rtc_engine/rtc_session.rs
++++ b/livekit/src/rtc_engine/rtc_session.rs
+@@ -1666,7 +1666,7 @@ impl SessionInner {
+                     );
+                 }
+             }
+-            RtcEvent::DataChannelBufferedAmountChange { sent, amount: _, kind } => {
++            RtcEvent::DataChannelBufferedAmountChange { sent, kind } => {
+                 let ev = DataChannelEvent {
+                     kind,
+                     detail: DataChannelEventDetail::BufferedAmountChange(sent),

@@ -36,10 +36,10 @@ jobs:
           - os: ubuntu-24.04-arm
             name: ubuntu-24.04-arm64
             generator: Ninja
-          - os: macos-26-xlarge
+          - os: macos-26
             name: macos-arm64
             generator: Ninja
-          - os: macos-26-large
+          - os: macos-26-intel
             name: macos-x64
             generator: Ninja
             # Pinned to Windows 2022 for current VS 17 implementation

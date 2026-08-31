@@ -1,8 +1,16 @@
 diff --git a/livekit/src/rtc_engine/rtc_events.rs b/livekit/src/rtc_engine/rtc_events.rs
-index a59aab5..2f052a0 100644
+index a59aab5..7b51092 100644
 --- a/livekit/src/rtc_engine/rtc_events.rs
 +++ b/livekit/src/rtc_engine/rtc_events.rs
-@@ -60,7 +60,6 @@ pub enum RtcEvent {
+@@ -26,6 +26,7 @@ use crate::{
+ };
+ 
+ pub type RtcEmitter = mpsc::UnboundedSender<RtcEvent>;
++pub type RtcWeakEmitter = mpsc::WeakUnboundedSender<RtcEvent>;
+ pub type RtcEvents = mpsc::UnboundedReceiver<RtcEvent>;
+ 
+ #[derive(Debug)]
+@@ -60,7 +61,6 @@ pub enum RtcEvent {
      },
      DataChannelBufferedAmountChange {
          sent: u64,
@@ -10,30 +18,178 @@ index a59aab5..2f052a0 100644
          kind: DataPacketKind,
      },
  }
-@@ -166,16 +165,14 @@ fn on_message(emitter: RtcEmitter, kind: DataPacketKind) -> rtc::data_channel::O
+@@ -70,31 +70,37 @@ pub enum RtcEvent {
+ 
+ fn on_connection_state_change(
+     target: proto::SignalTarget,
+-    emitter: RtcEmitter,
++    emitter: RtcWeakEmitter,
+ ) -> rtc::peer_connection::OnConnectionChange {
+     Box::new(move |state| {
+-        let _ = emitter.send(RtcEvent::ConnectionChange { state, target });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::ConnectionChange { state, target });
++        }
+     })
+ }
+ 
+ fn on_ice_candidate(
+     target: proto::SignalTarget,
+-    emitter: RtcEmitter,
++    emitter: RtcWeakEmitter,
+ ) -> rtc::peer_connection::OnIceCandidate {
+     Box::new(move |ice_candidate| {
+-        let _ = emitter.send(RtcEvent::IceCandidate { ice_candidate, target });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::IceCandidate { ice_candidate, target });
++        }
+     })
+ }
+ 
+-fn on_offer(target: proto::SignalTarget, emitter: RtcEmitter) -> OnOfferCreated {
++fn on_offer(target: proto::SignalTarget, emitter: RtcWeakEmitter) -> OnOfferCreated {
+     Box::new(move |offer| {
+-        let _ = emitter.send(RtcEvent::Offer { offer, target });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::Offer { offer, target });
++        }
+     })
+ }
+ 
+ fn on_data_channel(
+     target: proto::SignalTarget,
+-    emitter: RtcEmitter,
++    emitter: RtcWeakEmitter,
+ ) -> rtc::peer_connection::OnDataChannel {
+     Box::new(move |data_channel| {
+         match data_channel.label().as_str() {
+@@ -106,24 +112,28 @@ fn on_data_channel(
+             }
+             _ => {}
+         }
+-        let _ = emitter.send(RtcEvent::DataChannel { data_channel, target });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::DataChannel { data_channel, target });
++        }
+     })
+ }
+ 
+-fn on_track(target: proto::SignalTarget, emitter: RtcEmitter) -> rtc::peer_connection::OnTrack {
++fn on_track(target: proto::SignalTarget, emitter: RtcWeakEmitter) -> rtc::peer_connection::OnTrack {
+     Box::new(move |event| {
+-        let _ = emitter.send(RtcEvent::Track {
+-            streams: event.streams,
+-            track: event.track,
+-            transceiver: event.transceiver,
+-            target,
+-        });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::Track {
++                streams: event.streams,
++                track: event.track,
++                transceiver: event.transceiver,
++                target,
++            });
++        }
+     })
+ }
+ 
+ fn on_ice_candidate_error(
+     _target: proto::SignalTarget,
+-    _emitter: RtcEmitter,
++    _emitter: RtcWeakEmitter,
+ ) -> rtc::peer_connection::OnIceCandidateError {
+     Box::new(move |ice_error| {
+         log::debug!("{:?}", ice_error);
+@@ -132,6 +142,7 @@ fn on_ice_candidate_error(
+ 
+ pub fn forward_pc_events(transport: &mut PeerTransport, rtc_emitter: RtcEmitter) {
+     let signal_target = transport.signal_target();
++    let rtc_emitter = rtc_emitter.downgrade();
+     transport
+         .peer_connection()
+         .on_ice_candidate(Some(on_ice_candidate(signal_target, rtc_emitter.clone())));
+@@ -154,28 +165,31 @@ pub fn forward_pc_events(transport: &mut PeerTransport, rtc_emitter: RtcEmitter)
+     transport.on_offer(Some(on_offer(signal_target, rtc_emitter)));
+ }
+ 
+-fn on_message(emitter: RtcEmitter, kind: DataPacketKind) -> rtc::data_channel::OnMessage {
++fn on_message(emitter: RtcWeakEmitter, kind: DataPacketKind) -> rtc::data_channel::OnMessage {
+     Box::new(move |buffer| {
+-        let _ = emitter.send(RtcEvent::Data {
+-            data: buffer.data.to_vec(),
+-            binary: buffer.binary,
+-            kind,
+-        });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::Data {
++                data: buffer.data.to_vec(),
++                binary: buffer.binary,
++                kind,
++            });
++        }
+     })
+ }
  
  fn on_buffered_amount_change(
-     emitter: RtcEmitter,
+-    emitter: RtcEmitter,
 -    dc: DataChannel,
++    emitter: RtcWeakEmitter,
      kind: DataPacketKind,
  ) -> rtc::data_channel::OnBufferedAmountChange {
      Box::new(move |sent| {
 -        let amount = dc.buffered_amount();
 -        let _ = emitter.send(RtcEvent::DataChannelBufferedAmountChange { sent, amount, kind });
-+        let _ = emitter.send(RtcEvent::DataChannelBufferedAmountChange { sent, kind });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::DataChannelBufferedAmountChange { sent, kind });
++        }
      })
  }
  
  pub fn forward_dc_events(dc: &mut DataChannel, kind: DataPacketKind, rtc_emitter: RtcEmitter) {
++    let rtc_emitter = rtc_emitter.downgrade();
      dc.on_message(Some(on_message(rtc_emitter.clone(), kind)));
 -    dc.on_buffered_amount_change(Some(on_buffered_amount_change(rtc_emitter, dc.clone(), kind)));
 +    dc.on_buffered_amount_change(Some(on_buffered_amount_change(rtc_emitter, kind)));
  }
 diff --git a/livekit/src/rtc_engine/rtc_session.rs b/livekit/src/rtc_engine/rtc_session.rs
-index bb6c45f..88b1976 100644
+index bb6c45f..e60207c 100644
 --- a/livekit/src/rtc_engine/rtc_session.rs
 +++ b/livekit/src/rtc_engine/rtc_session.rs
-@@ -1666,7 +1666,7 @@ impl SessionInner {
+@@ -474,6 +474,10 @@ impl SessionParticipantInfo {
+ pub struct RtcSession {
+     inner: Arc<SessionInner>,
+     handle: Mutex<Option<SessionHandle>>,
++    // WebRTC callbacks keep only weak senders so they cannot retain the RTC
++    // event queue after the session is dropped. This guard owns the sender for
++    // exactly the outer session lifetime.
++    _rtc_emitter: rtc_events::RtcEmitter,
+ }
+ 
+ impl Debug for RtcSession {
+@@ -601,7 +605,11 @@ impl RtcSession {
+             rtc_events::forward_pc_events(sub_pc, rtc_emitter.clone());
+         }
+         rtc_events::forward_dc_events(&mut lossy_dc, DataPacketKind::Lossy, rtc_emitter.clone());
+-        rtc_events::forward_dc_events(&mut reliable_dc, DataPacketKind::Reliable, rtc_emitter);
++        rtc_events::forward_dc_events(
++            &mut reliable_dc,
++            DataPacketKind::Reliable,
++            rtc_emitter.clone(),
++        );
+ 
+         let (close_tx, close_rx) = watch::channel(false);
+ 
+@@ -707,7 +715,7 @@ impl RtcSession {
+             inner.publisher_negotiation_needed();
+         }
+ 
+-        Ok((Self { inner, handle }, join_response, session_events))
++        Ok((Self { inner, handle, _rtc_emitter: rtc_emitter }, join_response, session_events))
+     }
+ 
+     fn create_data_channels(
+@@ -1666,7 +1674,7 @@ impl SessionInner {
                      );
                  }
              }

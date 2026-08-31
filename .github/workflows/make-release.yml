@@ -143,10 +143,10 @@ jobs:
         run: rustup target add x86_64-apple-darwin
 
       # ---------- Cache Cargo ----------
-      # Key the target cache on the client-sdk-rust submodule SHA (Cargo.lock is
-      # pinned inside the submodule and froze the old cache). No clean step runs
-      # in this workflow, so the combined actions/cache post-job save captures
-      # the populated target/ correctly once the key busts on a submodule bump.
+      # The Rust FFI changes when either the pinned submodule or one of the fork
+      # patches changes, so both identities belong in the target cache key.
+      # No clean step runs in this workflow, so the combined actions/cache
+      # post-job save captures the populated target/ once that identity changes.
       - name: Resolve Rust submodule SHA
         id: rust_sha
         shell: bash
@@ -170,13 +170,13 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: client-sdk-rust/target/
-          key: ${{ matrix.os }}-${{ matrix.name }}-cargo-target-${{ steps.rust_sha.outputs.sha }}
+          key: ${{ matrix.os }}-${{ matrix.name }}-cargo-target-${{ steps.rust_sha.outputs.sha }}-${{ hashFiles('patches/client-sdk-rust/*.patch') }}
           restore-keys: |
             ${{ matrix.os }}-${{ matrix.name }}-cargo-target-
 
       # restore-keys can hydrate target/ from a prior submodule SHA. cxxbridge
       # artifacts in webrtc-sys are not compatible across those bumps.
-      - name: Drop stale cargo target on submodule SHA cache miss
+      - name: Drop stale cargo target on source identity cache miss
         if: steps.cache-cargo-target.outputs.cache-hit != 'true'
         shell: bash
         run: rm -rf client-sdk-rust/target/

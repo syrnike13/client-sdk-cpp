@@ -1,3 +1,49 @@
+diff --git a/livekit/src/room/e2ee/manager.rs b/livekit/src/room/e2ee/manager.rs
+index 5ee35cd..ff3b7c8 100644
+--- a/livekit/src/room/e2ee/manager.rs
++++ b/livekit/src/room/e2ee/manager.rs
+@@ -88,11 +88,14 @@ impl E2eeManager {
+     }
+ 
+     pub(crate) fn cleanup(&self) {
+-        let mut inner = self.inner.lock();
+-        for cryptor in inner.frame_cryptors.values() {
+-            cryptor.set_enabled(false);
++        {
++            let mut inner = self.inner.lock();
++            for cryptor in inner.frame_cryptors.values() {
++                cryptor.set_enabled(false);
++            }
++            inner.frame_cryptors.clear();
+         }
+-        inner.frame_cryptors.clear();
++        *self.state_changed.lock() = None;
+     }
+ 
+     /// Register to e2ee state changes
+@@ -383,4 +386,22 @@ mod tests {
+ 
+         assert!(needs_video_receiver_packet_trailer_handler(&features));
+     }
++
++    #[test]
++    fn cleanup_releases_state_changed_handler() {
++        let manager = E2eeManager::new(None, false);
++        let retained = Arc::new(());
++        let retained_weak = Arc::downgrade(&retained);
++        manager.on_state_changed({
++            let retained = retained.clone();
++            move |_, _| {
++                let _ = &retained;
++            }
++        });
++
++        drop(retained);
++        assert!(retained_weak.upgrade().is_some());
++        manager.cleanup();
++        assert!(retained_weak.upgrade().is_none());
++    }
+ }
 diff --git a/livekit/src/room/mod.rs b/livekit/src/room/mod.rs
 index b02d88e..c00819f 100644
 --- a/livekit/src/room/mod.rs

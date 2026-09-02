@@ -71,6 +71,33 @@ else()
   endif()
 endif()
 
+set(LIVEKIT_RUST_TRANSCEIVER_REUSE_TEST_PATCH
+  "${LIVEKIT_ROOT_DIR}/patches/client-sdk-rust/0003-test-publisher-transceiver-reuse-key.patch"
+)
+execute_process(
+  COMMAND "${GIT_EXECUTABLE}" apply --check "${LIVEKIT_RUST_TRANSCEIVER_REUSE_TEST_PATCH}"
+  WORKING_DIRECTORY "${LIVEKIT_ROOT_DIR}/client-sdk-rust"
+  RESULT_VARIABLE LIVEKIT_RUST_TRANSCEIVER_REUSE_TEST_PATCH_CHECK
+  ERROR_QUIET
+)
+if(LIVEKIT_RUST_TRANSCEIVER_REUSE_TEST_PATCH_CHECK EQUAL 0)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" apply "${LIVEKIT_RUST_TRANSCEIVER_REUSE_TEST_PATCH}"
+    WORKING_DIRECTORY "${LIVEKIT_ROOT_DIR}/client-sdk-rust"
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+else()
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${LIVEKIT_RUST_TRANSCEIVER_REUSE_TEST_PATCH}"
+    WORKING_DIRECTORY "${LIVEKIT_ROOT_DIR}/client-sdk-rust"
+    RESULT_VARIABLE LIVEKIT_RUST_TRANSCEIVER_REUSE_TEST_PATCH_REVERSE_CHECK
+    ERROR_QUIET
+  )
+  if(NOT LIVEKIT_RUST_TRANSCEIVER_REUSE_TEST_PATCH_REVERSE_CHECK EQUAL 0)
+    message(FATAL_ERROR "The pinned client-sdk-rust transceiver-reuse test patch no longer applies")
+  endif()
+endif()
+
 option(LIVEKIT_BUILD_EXAMPLES "Build LiveKit examples" OFF)
 option(LIVEKIT_BUILD_TESTS "Build LiveKit tests" OFF)
 

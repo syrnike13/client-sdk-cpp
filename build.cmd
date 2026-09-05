@@ -232,6 +232,24 @@ goto :eof
 
 :configure_build
 echo ==^> Configuring CMake (%BUILD_TYPE%)...
+REM Allow an explicitly selected Ninja toolchain from a developer command prompt.
+if /I "%CMAKE_GENERATOR%"=="Ninja" (
+    set "BUILD_TESTS=OFF"
+    set "BUILD_EXAMPLES=OFF"
+    if not "!CMD:tests=!"=="!CMD!" set "BUILD_TESTS=ON"
+    if not "!CMD:examples=!"=="!CMD!" set "BUILD_EXAMPLES=ON"
+    if not "!CMD:all=!"=="!CMD!" (
+        set "BUILD_TESTS=ON"
+        set "BUILD_EXAMPLES=ON"
+    )
+    if defined VCPKG_ROOT (
+        cmake --preset "%PRESET%" -G Ninja -A "" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON %CMAKE_EXTRA_ARGS%
+    ) else (
+        cmake -S . -B "%BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DLIVEKIT_BUILD_TESTS=!BUILD_TESTS! -DLIVEKIT_BUILD_EXAMPLES=!BUILD_EXAMPLES! -DCMAKE_EXPORT_COMPILE_COMMANDS=ON %CMAKE_EXTRA_ARGS%
+    )
+    if errorlevel 1 exit /b 1
+    goto build_only
+)
 if not defined VCPKG_ROOT (
     echo Warning: VCPKG_ROOT is not set. Attempting to configure without vcpkg...
     cmake -S . -B "%BUILD_DIR%" -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=%BUILD_TYPE% %CMAKE_EXTRA_ARGS%

@@ -143,7 +143,7 @@ index e60207c3..dd116d02 100644
      }
  
 @@ -1915,14 +1986,29 @@ impl SessionInner {
-             self.publisher_pc.set_max_send_bitrate_bps(ultimate_bps).await;
+                 .await;
          }
  
 -        let init = RtpTransceiverInit {

@@ -19,6 +19,7 @@
 #include <livekit/video_source.h>
 
 #include <array>
+#include <stdexcept>
 
 namespace livekit::test {
 
@@ -50,9 +51,13 @@ TEST_F(VideoSourceTest, PreEncodedSourceHasStrictEncodedInterface) {
   EXPECT_FALSE(source.takeKeyFrameRequest());
 
   constexpr std::array<std::uint8_t, 5> access_unit{0, 0, 0, 1, 0x65};
-  const EncodedVideoFrame frame{access_unit.data(), access_unit.size(), 1'000,
-                                true, {}};
-  EXPECT_FALSE(source.captureFrame(frame));
+  const EncodedVideoFrame frame{access_unit.data(), access_unit.size(), 1'000, true, {}};
+  // Acceptance transfers bytes to the source; it does not validate the H.264
+  // bitstream or imply that a subscriber has decoded it.
+  EXPECT_TRUE(source.captureFrame(frame));
+  EXPECT_THROW(source.captureFrame(EncodedVideoFrame{}), std::invalid_argument);
+  const EncodedVideoFrame empty_frame{access_unit.data(), 0, 1'000, true, {}};
+  EXPECT_THROW(source.captureFrame(empty_frame), std::invalid_argument);
 }
 
 } // namespace livekit::test

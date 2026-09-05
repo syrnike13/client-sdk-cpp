@@ -1,3 +1,20 @@
+diff --git a/.changeset/reused-screen-sender.md b/.changeset/reused-screen-sender.md
+new file mode 100644
+index 00000000..5896d522
+--- /dev/null
++++ b/.changeset/reused-screen-sender.md
+@@ -0,0 +1,11 @@
++---
++livekit: patch
++libwebrtc: patch
++webrtc-sys: patch
++livekit-ffi: patch
++---
++
++Keep the current track ID in publisher SDP when reusing an RTP sender for a
++replacement screen track. Return an absent track safely for inactive senders.
++This preserves bounded transceiver reuse while allowing the SFU to associate
++new RTP media with the replacement publication.
 diff --git a/libwebrtc/src/native/rtp_transceiver.rs b/libwebrtc/src/native/rtp_transceiver.rs
 index 3bd4fb59..a6a089bc 100644
 --- a/libwebrtc/src/native/rtp_transceiver.rs
@@ -15,6 +32,40 @@ index 3bd4fb59..a6a089bc 100644
      pub fn sender(&self) -> rtp_sender::RtpSender {
          rtp_sender::RtpSender { handle: RtpSender { sys_handle: self.sys_handle.sender() } }
      }
+diff --git a/libwebrtc/src/rtp_sender.rs b/libwebrtc/src/rtp_sender.rs
+index 1bdf96ad..ca60a36c 100644
+--- a/libwebrtc/src/rtp_sender.rs
++++ b/libwebrtc/src/rtp_sender.rs
+@@ -98,3 +98,29 @@ impl Debug for RtpSender {
+         f.debug_struct("RtpReceiver").field("cname", &self.parameters().rtcp.cname).finish()
+     }
+ }
++
++#[cfg(all(test, not(target_arch = "wasm32")))]
++mod tests {
++    #[test]
++    fn inactive_sender_has_no_track() {
++        use crate::{
++            peer_connection_factory::PeerConnectionFactory,
++            rtp_transceiver::{RtpTransceiverDirection, RtpTransceiverInit},
++            MediaType,
++        };
++        let factory = PeerConnectionFactory::default();
++        let connection = factory.create_peer_connection(Default::default()).unwrap();
++        let transceiver = connection
++            .add_transceiver_for_media(
++                MediaType::Video,
++                RtpTransceiverInit {
++                    direction: RtpTransceiverDirection::RecvOnly,
++                    stream_ids: vec![],
++                    send_encodings: vec![],
++                },
++            )
++            .unwrap();
++        assert!(transceiver.sender().track().is_none());
++        connection.close();
++    }
++}
 diff --git a/libwebrtc/src/rtp_transceiver.rs b/libwebrtc/src/rtp_transceiver.rs
 index 00a7a919..b033b780 100644
 --- a/libwebrtc/src/rtp_transceiver.rs
@@ -341,7 +392,7 @@ index b02d88e5..c00819f8 100644
                      == inner.local_participant.identity().as_str()
                  {
 diff --git a/livekit/src/rtc_engine/peer_transport.rs b/livekit/src/rtc_engine/peer_transport.rs
-index 7eccd2ef..79398610 100644
+index 7eccd2ef..bff336e5 100644
 --- a/livekit/src/rtc_engine/peer_transport.rs
 +++ b/livekit/src/rtc_engine/peer_transport.rs
 @@ -33,6 +33,7 @@ struct TransportInner {
@@ -410,7 +461,80 @@ index 7eccd2ef..79398610 100644
      }
  
      /// Munge SDP to change a=inactive to a=recvonly for RTP media m-lines in single PC mode.
-@@ -511,14 +521,18 @@ impl PeerTransport {
+@@ -448,6 +458,50 @@ impl PeerTransport {
+         munged
+     }
+ 
++    // SetTrack reuses libwebrtc's sender ID, which remains the first track's
++    // ID. LiveKit AddTrack signals the current track ID. Keep both SDP MSID
++    // forms aligned with that current ID when reusing a publisher m-line.
++    fn munge_sender_track_ids(
++        sdp: &str,
++        tracks: &std::collections::HashMap<String, String>,
++    ) -> String {
++        let eol = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
++        let lines: Vec<&str> = sdp.lines().collect();
++        let mut out = Vec::with_capacity(lines.len());
++        let mut start = 0;
++        while start < lines.len() {
++            let end = (start + 1..lines.len())
++                .find(|&i| lines[i].starts_with("m="))
++                .unwrap_or(lines.len());
++            let track = lines[start..end]
++                .iter()
++                .find_map(|line| line.strip_prefix("a=mid:"))
++                .and_then(|mid| tracks.get(mid));
++            for line in &lines[start..end] {
++                let msid = if line.starts_with("a=msid:") {
++                    Some(7)
++                } else if line.starts_with("a=ssrc:") {
++                    line.find(" msid:").map(|i| i + 6)
++                } else {
++                    None
++                };
++                if let (Some(track), Some(offset)) = (track, msid) {
++                    if let Some(stream) = line[offset..].split_whitespace().next() {
++                        out.push(format!("{}{stream} {track}", &line[..offset]));
++                        continue;
++                    }
++                }
++                out.push((*line).to_owned());
++            }
++            start = end;
++        }
++        let mut result = out.join(eol);
++        if sdp.ends_with('\n') {
++            result.push_str(eol);
++        }
++        result
++    }
++
+     pub async fn create_and_send_offer(&self, options: OfferOptions) -> EngineResult<()> {
+         let mut inner = self.inner.lock().await;
+         if options.ice_restart {
+@@ -478,6 +532,21 @@ impl PeerTransport {
+ 
+         let mut offer = self.peer_connection.create_offer(options).await?;
+         let mut sdp = offer.to_string();
++        let tracks = self
++            .peer_connection
++            .transceivers()
++            .into_iter()
++            .filter_map(|transceiver| {
++                Some((transceiver.mid()?, transceiver.sender().track()?.id()))
++            })
++            .collect();
++        let current_ids = Self::munge_sender_track_ids(&sdp, &tracks);
++        if current_ids != sdp {
++            offer = SessionDescription::parse(&current_ids, offer.sdp_type()).map_err(|error| {
++                super::EngineError::Internal(format!("Invalid current-track SDP: {error}").into())
++            })?;
++            sdp = current_ids;
++        }
+ 
+         if inner.single_pc_mode {
+             // Fix inactive media m-lines to recvonly for single PC mode.
+@@ -511,14 +580,18 @@ impl PeerTransport {
          }
  
          // Apply x-google-start-bitrate for all video codecs to improve initial quality.
@@ -431,8 +555,20 @@ index 7eccd2ef..79398610 100644
                  log::info!(
                      "Applying x-google-start-bitrate={} kbps (target_bps={:?})",
                      start_kbps,
-@@ -554,6 +568,12 @@ impl PeerTransport {
+@@ -552,8 +625,24 @@ impl PeerTransport {
+ 
+ #[cfg(test)]
  mod tests {
++    #[test]
++    fn reused_sender_msid_follows_current_track_and_preserves_receiver() {
++        let original = "v=0\r\nm=video 9 RTP/AVP 96\r\na=mid:8\r\na=msid:- old\r\na=ssrc:123 msid:- old\r\na=ssrc:124 msid:screen old\r\nm=audio 9 RTP/AVP 111\r\na=mid:9\r\na=msid:remote receiver\r\n";
++        let tracks = std::collections::HashMap::from([("8".to_owned(), "new".to_owned())]);
++        let expected = original.replace("- old", "- new").replace("screen old", "screen new");
++        assert_eq!(PeerTransport::munge_sender_track_ids(original, &tracks), expected);
++        assert_eq!(PeerTransport::munge_sender_track_ids(&expected, &tracks), expected);
++        assert_eq!(PeerTransport::munge_sender_track_ids(original, &Default::default()), original);
++    }
++
      use super::PeerTransport;
  
 +    #[test]
@@ -599,7 +735,7 @@ index a59aab58..7b51092e 100644
 +    dc.on_buffered_amount_change(Some(on_buffered_amount_change(rtc_emitter, kind)));
  }
 diff --git a/livekit/src/rtc_engine/rtc_session.rs b/livekit/src/rtc_engine/rtc_session.rs
-index bb6c45f3..720930d5 100644
+index bb6c45f3..bc9a6da1 100644
 --- a/livekit/src/rtc_engine/rtc_session.rs
 +++ b/livekit/src/rtc_engine/rtc_session.rs
 @@ -379,6 +379,8 @@ struct SessionInner {
@@ -839,7 +975,7 @@ index bb6c45f3..720930d5 100644
  
      #[test]
      fn parses_max_message_size_from_application_section() {
-@@ -2613,4 +2734,45 @@ mod tests {
+@@ -2613,4 +2734,36 @@ mod tests {
          assert_eq!(parse_sdp_max_message_size("a=max-message-size:abc\r\n"), None);
          assert_eq!(parse_sdp_max_message_size("a=max-message-size:\r\n"), None);
      }
@@ -863,22 +999,13 @@ index bb6c45f3..720930d5 100644
 +
 +    #[test]
 +    fn transceiver_reuse_key_separates_media_kind_and_rid_layout() {
-+        let video = TransceiverReuseKey {
-+            video: true,
-+            encoding_rids: vec!["f".into(), "h".into()],
-+        };
-+        let audio = TransceiverReuseKey {
-+            video: false,
-+            encoding_rids: vec!["f".into(), "h".into()],
-+        };
-+        let reversed = TransceiverReuseKey {
-+            video: true,
-+            encoding_rids: vec!["h".into(), "f".into()],
-+        };
-+        let different_rids = TransceiverReuseKey {
-+            video: true,
-+            encoding_rids: vec!["f".into()],
-+        };
++        let video =
++            TransceiverReuseKey { video: true, encoding_rids: vec!["f".into(), "h".into()] };
++        let audio =
++            TransceiverReuseKey { video: false, encoding_rids: vec!["f".into(), "h".into()] };
++        let reversed =
++            TransceiverReuseKey { video: true, encoding_rids: vec!["h".into(), "f".into()] };
++        let different_rids = TransceiverReuseKey { video: true, encoding_rids: vec!["f".into()] };
 +
 +        assert_ne!(video, audio);
 +        assert_ne!(video, reversed);
@@ -897,3 +1024,18 @@ index cd45b9e3..0e12bbf0 100644
      info.is_hardware_accelerated = false;
      info.supports_simulcast = false;
      info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNative};
+diff --git a/webrtc-sys/src/rtp_sender.cpp b/webrtc-sys/src/rtp_sender.cpp
+index e97bed2d..24ae4db9 100644
+--- a/webrtc-sys/src/rtp_sender.cpp
++++ b/webrtc-sys/src/rtp_sender.cpp
+@@ -153,7 +153,9 @@ bool RtpSender::set_track(std::shared_ptr<MediaStreamTrack> track) const {
+ }
+ 
+ std::shared_ptr<MediaStreamTrack> RtpSender::track() const {
+-  return rtc_runtime_->get_or_create_media_stream_track(sender_->track());
++  auto track = sender_->track();
++  if (!track) return nullptr;
++  return rtc_runtime_->get_or_create_media_stream_track(track);
+ }
+ 
+ uint32_t RtpSender::ssrc() const {

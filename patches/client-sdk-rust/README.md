@@ -8,8 +8,12 @@ It replaces the former three-patch series plus the unpublished local Rust
 commit `247ef11b8f4aa87dc877d6ad2a40b4b28cf78a4b`.
 
 The resulting normalized Git tree is exactly
-`f042986ae7f0d68e04f41f086b19375c012c4982`, matching the previously tested local
-worktree. A single patch permits strict forward/reverse applicability checks
+`cf1625a3bce834c10a0372b9269c5eed30cad2a7`. It additionally fixes current-track
+MSID signalling for reused screen senders and safely returns an absent track
+for inactive RTP senders. Both defects have focused regression tests; the
+replacement path was also decoded by a neutral application observer through
+six publication generations and recovery to 1080p60.
+A single patch permits strict forward/reverse applicability checks
 even where the former patches changed one another's context. CMake applies it
 on a clean checkout and verifies its reverse on reconfiguration.
 

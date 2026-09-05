@@ -34,6 +34,7 @@ jobs:
         with:
           filters: |
             builds:
+              - patches/client-sdk-rust/**
               - src/**
               - include/**
               - benchmarks/**
@@ -50,6 +51,7 @@ jobs:
               - .github/workflows/ci.yml
               - .github/workflows/builds.yml
             tests:
+              - patches/client-sdk-rust/**
               - src/**
               - include/**
               - client-sdk-rust
@@ -74,6 +76,7 @@ jobs:
               - .github/workflows/generate-docs.yml
               - .github/workflows/publish-docs.yml
             cpp_tools:
+              - patches/client-sdk-rust/**
               - src/**
               - include/**
               - benchmarks/**
@@ -90,6 +93,7 @@ jobs:
               - .github/workflows/ci.yml
               - .github/workflows/cpp-tools.yml
             rust_release_check:
+              - patches/client-sdk-rust/**
               - client-sdk-rust
 
   builds:

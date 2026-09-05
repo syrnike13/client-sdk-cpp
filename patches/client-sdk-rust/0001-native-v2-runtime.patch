@@ -1,3 +1,20 @@
+diff --git a/.changeset/preencoded-reference-continuity.md b/.changeset/preencoded-reference-continuity.md
+new file mode 100644
+index 00000000..d267a689
+--- /dev/null
++++ b/.changeset/preencoded-reference-continuity.md
+@@ -0,0 +1,11 @@
++---
++webrtc-sys: patch
++libwebrtc: patch
++livekit: patch
++livekit-ffi: patch
++---
++
++Fence pre-encoded reference continuity across WebRTC encoder-queue drops.
++The pass-through encoder requests a fresh keyframe and suppresses dependent
++access units until it arrives, instead of forwarding a damaged reference chain.
++Continuity is private to each encoder and resets on encoder/source replacement.
 diff --git a/.changeset/reused-screen-sender.md b/.changeset/reused-screen-sender.md
 new file mode 100644
 index 00000000..5896d522
@@ -1012,11 +1029,233 @@ index bb6c45f3..bc9a6da1 100644
 +        assert_ne!(video, different_rids);
 +    }
  }
+diff --git a/webrtc-sys/include/livekit/encoded_reference_continuity.h b/webrtc-sys/include/livekit/encoded_reference_continuity.h
+new file mode 100644
+index 00000000..d71b0f0e
+--- /dev/null
++++ b/webrtc-sys/include/livekit/encoded_reference_continuity.h
+@@ -0,0 +1,50 @@
++/*
++ * Copyright 2026 LiveKit, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#pragma once
++
++#include <cstdint>
++
++namespace livekit {
++
++// Encoder-queue drops are safe for raw frames, but break pre-encoded
++// references. This state belongs to one pass-through encoder, not the shared
++// capture source.
++class EncodedReferenceContinuity {
++ public:
++  [[nodiscard]] bool admit(std::uint64_t sequence, bool keyframe) noexcept {
++    if (sequence == 0 || sequence <= last_sequence_) {
++      waiting_for_keyframe_ = true;
++      return false;
++    }
++    const bool consecutive = sequence - last_sequence_ == 1;
++    last_sequence_ = sequence;
++    if (keyframe) {
++      waiting_for_keyframe_ = false;
++      return true;
++    }
++    if (!consecutive)
++      waiting_for_keyframe_ = true;
++    return !waiting_for_keyframe_;
++  }
++
++  void invalidate() noexcept { waiting_for_keyframe_ = true; }
++
++ private:
++  std::uint64_t last_sequence_ = 0;
++  bool waiting_for_keyframe_ = true;
++};
++
++}  // namespace livekit
+diff --git a/webrtc-sys/include/livekit/encoded_video_frame_buffer.h b/webrtc-sys/include/livekit/encoded_video_frame_buffer.h
+index 40e5fece..f0e7c560 100644
+--- a/webrtc-sys/include/livekit/encoded_video_frame_buffer.h
++++ b/webrtc-sys/include/livekit/encoded_video_frame_buffer.h
+@@ -89,6 +89,13 @@ class EncodedVideoFrameBuffer : public webrtc::VideoFrameBuffer {
+   EncodedVideoCodec codec() const { return codec_; }
+   EncodedFrameType frame_type() const { return frame_type_; }
+ 
++  // Assigned by the source before publishing this immutable frame to sinks.
++  void set_capture_sequence(uint64_t sequence) { capture_sequence_ = sequence; }
++  uint64_t capture_sequence() const { return capture_sequence_; }
++  const std::shared_ptr<std::atomic<bool>>& source_identity() const {
++    return keyframe_request_flag_;
++  }
++
+   // The encoded access unit. Shared with the pass-through encoder so the
+   // payload is not copied again on the send path.
+   webrtc::scoped_refptr<webrtc::EncodedImageBuffer> encoded_data() const {
+@@ -111,6 +118,7 @@ class EncodedVideoFrameBuffer : public webrtc::VideoFrameBuffer {
+   int height_;
+   EncodedVideoCodec codec_;
+   EncodedFrameType frame_type_;
++  uint64_t capture_sequence_ = 0;
+   webrtc::scoped_refptr<webrtc::EncodedImageBuffer> payload_;
+   std::shared_ptr<std::atomic<bool>> keyframe_request_flag_;
+   std::shared_ptr<EncodedRateControlState> rate_control_state_;
+diff --git a/webrtc-sys/include/livekit/video_track.h b/webrtc-sys/include/livekit/video_track.h
+index 21337794..042ee055 100644
+--- a/webrtc-sys/include/livekit/video_track.h
++++ b/webrtc-sys/include/livekit/video_track.h
+@@ -21,8 +21,8 @@
+ 
+ #include "api/media_stream_interface.h"
+ #include "api/video/video_frame.h"
+-#include "livekit/helper.h"
+ #include "livekit/encoded_video_frame_buffer.h"
++#include "livekit/helper.h"
+ #include "livekit/media_stream_track.h"
+ #include "livekit/video_frame.h"
+ #include "livekit/webrtc.h"
+@@ -91,9 +91,9 @@ class VideoTrackSource {
+   class InternalSource : public webrtc::AdaptedVideoTrackSource {
+    public:
+     InternalSource(const VideoResolution& resolution,
+-                   bool is_screencast);  // (0, 0) means no resolution/optional, the
+-                                         // source will guess the resolution at the
+-                                         // first captured frame
++                   bool is_screencast);  // (0, 0) means no resolution/optional,
++                                         // the source will guess the resolution
++                                         // at the first captured frame
+     ~InternalSource() override;
+ 
+     bool is_screencast() const override;
+@@ -120,6 +120,7 @@ class VideoTrackSource {
+    private:
+     mutable webrtc::Mutex mutex_;
+     webrtc::TimestampAligner timestamp_aligner_;
++    uint64_t encoded_capture_sequence_ = 0;
+     VideoResolution resolution_;
+     std::shared_ptr<PacketTrailerHandler> packet_trailer_handler_;
+     std::shared_ptr<std::atomic<bool>> keyframe_request_flag_ =
+@@ -170,7 +171,8 @@ class VideoTrackSource {
+ };
+ 
+ std::shared_ptr<VideoTrackSource> new_video_track_source(
+-    const VideoResolution& resolution, bool is_screencast);
++    const VideoResolution& resolution,
++    bool is_screencast);
+ 
+ static std::shared_ptr<MediaStreamTrack> video_to_media(
+     std::shared_ptr<VideoTrack> track) {
 diff --git a/webrtc-sys/src/passthrough_video_encoder.cpp b/webrtc-sys/src/passthrough_video_encoder.cpp
-index cd45b9e3..0e12bbf0 100644
+index cd45b9e3..15fab01e 100644
 --- a/webrtc-sys/src/passthrough_video_encoder.cpp
 +++ b/webrtc-sys/src/passthrough_video_encoder.cpp
-@@ -331,6 +331,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+@@ -26,12 +26,13 @@
+ 
+ #include "absl/container/inlined_vector.h"
+ #include "api/video/encoded_image.h"
+-#include "api/video/video_frame.h"
+ #include "api/video/video_codec_constants.h"
++#include "api/video/video_frame.h"
+ #include "api/video_codecs/scalability_mode.h"
+ #include "api/video_codecs/video_encoder.h"
+ #include "av1_bitstream.h"
+ #include "common_video/h264/h264_common.h"
++#include "livekit/encoded_reference_continuity.h"
+ #include "livekit/encoded_video_frame_buffer.h"
+ #include "media/base/media_constants.h"
+ #include "modules/video_coding/include/video_codec_interface.h"
+@@ -193,6 +194,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+       return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+     }
+     codec_ = *codec_settings;
++    reference_continuity_ = {};
++    source_identity_.reset();
+     cached_sequence_header_obu_.clear();
+     av1_svc_controller_ = ScalableVideoControllerNoLayering();
+     if (IsAv1Codec(codec_type_) && !codec_.GetScalabilityMode().has_value()) {
+@@ -215,8 +218,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+   int32_t Encode(const VideoFrame& frame,
+                  const std::vector<VideoFrameType>* frame_types) override {
+     if (!encoded_image_callback_) {
+-      RTC_LOG(LS_ERROR)
+-          << "PassthroughVideoEncoder callback is not registered";
++      RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder callback is not registered";
+       return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+     }
+ 
+@@ -268,8 +270,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+       livekit::av1::NormalizeForRtp(&payload);
+ 
+       std::vector<uint8_t> sequence_header;
+-      if (livekit::av1::ExtractSequenceHeaderObu(
+-              payload.data(), payload.size(), &sequence_header)) {
++      if (livekit::av1::ExtractSequenceHeaderObu(payload.data(), payload.size(),
++                                                 &sequence_header)) {
+         cached_sequence_header_obu_ = std::move(sequence_header);
+       } else if (is_keyframe && !cached_sequence_header_obu_.empty()) {
+         livekit::av1::EnsureSequenceHeaderOnKeyframe(
+@@ -287,6 +289,20 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+       encoded_data = encoded_buffer->encoded_data();
+     }
+ 
++    if (source_identity_ != encoded_buffer->source_identity()) {
++      source_identity_ = encoded_buffer->source_identity();
++      reference_continuity_ = {};
++    }
++    if (!reference_continuity_.admit(encoded_buffer->capture_sequence(),
++                                     is_keyframe)) {
++      // A previous access unit can be discarded by WebRTC before Encode().
++      // Forwarding its dependent frames would corrupt every receiver until IDR.
++      encoded_buffer->request_keyframe();
++      encoded_image_callback_->OnDroppedFrame(
++          EncodedImageCallback::DropReason::kDroppedByEncoder);
++      return WEBRTC_VIDEO_CODEC_OK;
++    }
++
+     EncodedImage encoded_image;
+     encoded_image._encodedWidth = encoded_buffer->width();
+     encoded_image._encodedHeight = encoded_buffer->height();
+@@ -297,7 +313,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+     encoded_image.rotation_ = frame.rotation();
+     encoded_image.content_type_ = webrtc::VideoContentType::UNSPECIFIED;
+     encoded_image.timing_.flags = webrtc::VideoSendTiming::kInvalid;
+-    encoded_image._frameType = FrameTypeFromBuffer(encoded_buffer->frame_type());
++    encoded_image._frameType =
++        FrameTypeFromBuffer(encoded_buffer->frame_type());
+     encoded_image.SetColorSpace(frame.color_space());
+     const size_t encoded_size = encoded_data->size();
+     encoded_image.SetEncodedData(std::move(encoded_data));
+@@ -306,13 +323,15 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+ 
+     CodecSpecificInfo codec_info;
+     codec_info.codecSpecific = {};
+-    FillSingleLayerCodecSpecific(&codec_info, codec_type_, encoded_buffer->width(),
+-                                 encoded_buffer->height(), is_keyframe,
+-                                 &av1_svc_controller_);
++    FillSingleLayerCodecSpecific(
++        &codec_info, codec_type_, encoded_buffer->width(),
++        encoded_buffer->height(), is_keyframe, &av1_svc_controller_);
+ 
+     const auto result =
+         encoded_image_callback_->OnEncodedImage(encoded_image, &codec_info);
+     if (result.error != EncodedImageCallback::Result::OK) {
++      reference_continuity_.invalidate();
++      encoded_buffer->request_keyframe();
+       RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder callback failed "
+                         << result.error;
+       return WEBRTC_VIDEO_CODEC_ERROR;
+@@ -331,6 +350,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
      info.supports_native_handle = true;
      info.implementation_name = "LiveKit pre-encoded passthrough";
      info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
@@ -1024,6 +1263,42 @@ index cd45b9e3..0e12bbf0 100644
      info.is_hardware_accelerated = false;
      info.supports_simulcast = false;
      info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNative};
+@@ -338,8 +358,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+   }
+ 
+  private:
+-  void ForwardPendingRateControl(
+-      EncodedVideoFrameBuffer* encoded_buffer) {
++  void ForwardPendingRateControl(EncodedVideoFrameBuffer* encoded_buffer) {
+     std::optional<livekit::EncodedRateControlRequest> request;
+     {
+       webrtc::MutexLock lock(&rate_control_mutex_);
+@@ -357,10 +376,13 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+   VideoCodecType codec_type_;
+   VideoCodec codec_;
+   EncodedImageCallback* encoded_image_callback_ = nullptr;
++  livekit::EncodedReferenceContinuity reference_continuity_;
++  std::shared_ptr<std::atomic<bool>> source_identity_;
+   ScalableVideoControllerNoLayering av1_svc_controller_;
+   std::vector<uint8_t> cached_sequence_header_obu_;
+   webrtc::Mutex rate_control_mutex_;
+-  std::optional<livekit::EncodedRateControlRequest> latest_rate_control_request_;
++  std::optional<livekit::EncodedRateControlRequest>
++      latest_rate_control_request_;
+ };
+ 
+ }  // namespace
+@@ -388,8 +410,8 @@ PassthroughVideoEncoderFactory::GetSupportedFormats() const {
+   return supported_formats_;
+ }
+ 
+-std::vector<SdpVideoFormat>
+-PassthroughVideoEncoderFactory::GetImplementations() const {
++std::vector<SdpVideoFormat> PassthroughVideoEncoderFactory::GetImplementations()
++    const {
+   return supported_formats_;
+ }
+ 
 diff --git a/webrtc-sys/src/rtp_sender.cpp b/webrtc-sys/src/rtp_sender.cpp
 index e97bed2d..24ae4db9 100644
 --- a/webrtc-sys/src/rtp_sender.cpp
@@ -1039,3 +1314,114 @@ index e97bed2d..24ae4db9 100644
  }
  
  uint32_t RtpSender::ssrc() const {
+diff --git a/webrtc-sys/src/video_track.cpp b/webrtc-sys/src/video_track.cpp
+index ba89c298..333a890f 100644
+--- a/webrtc-sys/src/video_track.cpp
++++ b/webrtc-sys/src/video_track.cpp
+@@ -56,7 +56,8 @@ livekit::EncodedVideoCodec ToNativeEncodedCodec(EncodedVideoCodec codec) {
+   }
+ }
+ 
+-livekit::EncodedFrameType ToNativeEncodedFrameType(EncodedFrameType frame_type) {
++livekit::EncodedFrameType ToNativeEncodedFrameType(
++    EncodedFrameType frame_type) {
+   switch (frame_type) {
+     case EncodedFrameType::Key:
+       return livekit::EncodedFrameType::kKey;
+@@ -80,9 +81,10 @@ VideoTrack::~VideoTrack() {
+ 
+ void VideoTrack::add_sink(const std::shared_ptr<NativeVideoSink>& sink) const {
+   webrtc::MutexLock lock(&mutex_);
+-  track()->AddOrUpdateSink(sink.get(),
+-                           webrtc::VideoSinkWants());  // TODO(theomonnom): Expose
+-                                                    // VideoSinkWants to Rust?
++  track()->AddOrUpdateSink(
++      sink.get(),
++      webrtc::VideoSinkWants());  // TODO(theomonnom): Expose
++                                  // VideoSinkWants to Rust?
+   sinks_.push_back(sink);
+ }
+ 
+@@ -137,8 +139,11 @@ std::shared_ptr<NativeVideoSink> new_native_video_sink(
+ }
+ 
+ VideoTrackSource::InternalSource::InternalSource(
+-    const VideoResolution& resolution, bool is_screencast)
+-    : webrtc::AdaptedVideoTrackSource(4), resolution_(resolution), is_screencast_(is_screencast) {}
++    const VideoResolution& resolution,
++    bool is_screencast)
++    : webrtc::AdaptedVideoTrackSource(4),
++      resolution_(resolution),
++      is_screencast_(is_screencast) {}
+ 
+ VideoTrackSource::InternalSource::~InternalSource() {}
+ 
+@@ -195,12 +200,13 @@ bool VideoTrackSource::InternalSource::on_captured_frame(
+   // Pre-encoded access units bypass the adapter entirely: frame-rate and
+   // resolution adaptation operate on raw frames, and dropping or scaling an
+   // encoded delta frame would corrupt the bitstream for every receiver.
+-  if (livekit::EncodedVideoFrameBuffer::FromNative(buffer.get())) {
++  if (auto* encoded =
++          livekit::EncodedVideoFrameBuffer::FromNative(buffer.get())) {
++    encoded->set_capture_sequence(++encoded_capture_sequence_);
+     if (packet_trailer_handler_) {
+       packet_trailer_handler_->emit_publish_timing(
+           VideoPublishTimingStage::EncoderUpload,
+-          frame_metadata.has_packet_trailer ? frame_metadata.user_timestamp
+-                                            : 0,
++          frame_metadata.has_packet_trailer ? frame_metadata.user_timestamp : 0,
+           frame_metadata.has_packet_trailer ? frame_metadata.frame_id : 0);
+     }
+     OnFrame(webrtc::VideoFrame::Builder()
+@@ -252,7 +258,8 @@ void VideoTrackSource::InternalSource::set_packet_trailer_handler(
+   packet_trailer_handler_ = std::move(handler);
+ }
+ 
+-VideoTrackSource::VideoTrackSource(const VideoResolution& resolution, bool is_screencast) {
++VideoTrackSource::VideoTrackSource(const VideoResolution& resolution,
++                                   bool is_screencast) {
+   source_ = webrtc::make_ref_counted<InternalSource>(resolution, is_screencast);
+ }
+ 
+@@ -267,12 +274,13 @@ bool VideoTrackSource::on_captured_frame(
+   return source_->on_captured_frame(rtc_frame, frame_metadata);
+ }
+ 
+-bool VideoTrackSource::capture_dmabuf_frame(int dmabuf_fd,
+-                                            int width,
+-                                            int height,
+-                                            int pixel_format,
+-                                            int64_t timestamp_us,
+-                                            const FrameMetadata& frame_metadata) const {
++bool VideoTrackSource::capture_dmabuf_frame(
++    int dmabuf_fd,
++    int width,
++    int height,
++    int pixel_format,
++    int64_t timestamp_us,
++    const FrameMetadata& frame_metadata) const {
+   auto dmabuf_pixel_format =
+       static_cast<livekit::DmaBufPixelFormat>(pixel_format);
+   auto buffer = webrtc::make_ref_counted<livekit::DmaBufVideoFrameBuffer>(
+@@ -324,9 +332,8 @@ bool VideoTrackSource::take_keyframe_request() const {
+ 
+ EncodedRateControlRequest VideoTrackSource::take_rate_control_request() const {
+   auto request = source_->rate_control_state()->Take();
+-  return EncodedRateControlRequest{request.has_request,
+-                                   request.target_bitrate_bps,
+-                                   request.framerate_fps};
++  return EncodedRateControlRequest{
++      request.has_request, request.target_bitrate_bps, request.framerate_fps};
+ }
+ 
+ void VideoTrackSource::set_packet_trailer_handler(
+@@ -340,7 +347,8 @@ webrtc::scoped_refptr<VideoTrackSource::InternalSource> VideoTrackSource::get()
+ }
+ 
+ std::shared_ptr<VideoTrackSource> new_video_track_source(
+-    const VideoResolution& resolution, bool is_screencast) {
++    const VideoResolution& resolution,
++    bool is_screencast) {
+   return std::make_shared<VideoTrackSource>(resolution, is_screencast);
+ }
+ 

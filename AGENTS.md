@@ -129,6 +129,11 @@ To create an installable SDK bundle, use the same build command with
 The build scripts pass an explicit job count to `cmake --build --parallel`. Set
 `CMAKE_BUILD_PARALLEL_LEVEL` to override the default detected logical CPU count.
 
+On Windows, `CMAKE_GENERATOR=Ninja` selects Ninja explicitly in an x64 Visual
+Studio developer prompt and emits `compile_commands.json`. Set `VCPKG_ROOT`
+for a fresh configuration; do not switch generators inside an existing build
+directory. The default remains the Visual Studio 2022 preset.
+
 **Requirements:** CMake 3.20+, C++17, Rust toolchain (cargo), protoc. On macOS: `brew install cmake ninja protobuf abseil`. On Linux: see the CI workflow for apt packages. spdlog is vendored automatically via FetchContent (or vcpkg on Windows) to avoid system conflicts.
 
 ### SDK Packaging

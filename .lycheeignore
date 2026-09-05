@@ -10,3 +10,6 @@ https://livekit.io/join-slack
 https://livekit.com/join-slack
 https://join.slack.com/*
 https://livekit-users.slack.com/*
+
+# Social profile rejects the CI checker with HTTP 403.
+https://x.com/livekit

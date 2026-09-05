@@ -43,6 +43,12 @@ git lfs pull
 
 ## Recommended setup
 
+On Windows the build script defaults to the Visual Studio 2022 generator.
+For an installed Ninja toolchain, run `set CMAKE_GENERATOR=Ninja` in an x64
+Visual Studio developer prompt, set `VCPKG_ROOT`, and use the same `build.cmd`
+commands. Ninja emits `build-release/compile_commands.json` for static analysis.
+Use a fresh build directory when changing generators.
+
 These are the exact packages our CI uses. They will also work for examples.
 
 ### macOS

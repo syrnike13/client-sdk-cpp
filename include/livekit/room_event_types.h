@@ -34,7 +34,14 @@ class LocalTrackPublication;
 class RemoteTrackPublication;
 class TrackPublication;
 
-enum class VideoCodec;
+/// @brief Video codec negotiated for a published track.
+enum class VideoCodec {
+  VP8 = 0,
+  H264 = 1,
+  AV1 = 2,
+  VP9 = 3,
+  H265 = 4,
+};
 enum class TrackSource;
 
 /// Overall quality of a participant's connection.
@@ -304,6 +311,18 @@ enum class DegradationPreference {
   MaintainFramerateAndResolution = 4,
 };
 
+/// @brief Selects the encoder backend for a published video track.
+enum class VideoEncoderBackend {
+  Auto = 0,
+  Software = 1,
+  Hardware = 2,
+  Nvenc = 3,
+  Vaapi = 4,
+  VideoToolbox = 5,
+  /// Use access units supplied through @ref EncodedVideoSource without fallback.
+  PreEncoded = 6,
+};
+
 /// Optional frame metadata features for published video tracks.
 struct FrameMetadataFeatures {
   /// Embed a user-supplied wall-clock timestamp.
@@ -351,6 +370,9 @@ struct TrackPublishOptions {
 
   /// Optional frame metadata features to enable for published video.
   std::optional<FrameMetadataFeatures> frame_metadata_features;
+
+  /// Encoder backend. Use PreEncoded with @ref EncodedVideoSource.
+  std::optional<VideoEncoderBackend> video_encoder;
 
   /// @deprecated Use frame_metadata_features instead.
   [[deprecated("TrackPublishOptions::packet_trailer_features is deprecated; use frame_metadata_features instead")]]

@@ -16,6 +16,38 @@ set(LIVEKIT_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(warnings)
 
+# A consolidated patch preserves overlapping H264/transceiver changes and lets
+# reconfiguration verify the complete already-patched state without mutation.
+find_package(Git REQUIRED)
+set(LIVEKIT_RUST_PATCHES
+  "${LIVEKIT_ROOT_DIR}/patches/client-sdk-rust/0001-native-v2-runtime.patch"
+)
+execute_process(
+  COMMAND "${GIT_EXECUTABLE}" apply --check ${LIVEKIT_RUST_PATCHES}
+  WORKING_DIRECTORY "${LIVEKIT_ROOT_DIR}/client-sdk-rust"
+  RESULT_VARIABLE LIVEKIT_RUST_PATCH_CHECK
+  ERROR_QUIET
+)
+if(LIVEKIT_RUST_PATCH_CHECK EQUAL 0)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" apply ${LIVEKIT_RUST_PATCHES}
+    WORKING_DIRECTORY "${LIVEKIT_ROOT_DIR}/client-sdk-rust"
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+else()
+  set(LIVEKIT_RUST_REVERSE_PATCHES ${LIVEKIT_RUST_PATCHES})
+  list(REVERSE LIVEKIT_RUST_REVERSE_PATCHES)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" apply --reverse --check ${LIVEKIT_RUST_REVERSE_PATCHES}
+    WORKING_DIRECTORY "${LIVEKIT_ROOT_DIR}/client-sdk-rust"
+    RESULT_VARIABLE LIVEKIT_RUST_PATCH_REVERSE_CHECK
+    ERROR_QUIET
+  )
+  if(NOT LIVEKIT_RUST_PATCH_REVERSE_CHECK EQUAL 0)
+    message(FATAL_ERROR "The pinned client-sdk-rust patch series no longer applies")
+  endif()
+endif()
+
 option(LIVEKIT_BUILD_EXAMPLES "Build LiveKit examples" OFF)
 option(LIVEKIT_BUILD_TESTS "Build LiveKit tests" OFF)
 

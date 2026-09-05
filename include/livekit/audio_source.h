@@ -99,10 +99,15 @@ public:
   /// zero samples.
   /// @param timeout_ms  Maximum time to wait for the FFI callback.
   ///                    - If timeout_ms > 0: block up to this duration.
-  ///                      A timeout will cause std::runtime_error.
+  ///                      A timeout throws std::system_error with
+  ///                      std::errc::timed_out (a std::runtime_error subtype).
+  ///                      This does not cancel native processing; callers must
+  ///                      stop admission rather than accumulate timed-out work.
   ///                    - If timeout_ms == 0: wait indefinitely until the
   /// callback arrives (recommended for production unless the caller needs
   /// explicit timeout control).
+  ///                    - A negative timeout throws std::invalid_argument before
+  ///                      submitting any frame.
   ///
   /// Blocking semantics:
   /// The blocking behavior of this call depends on the buffering mode selected

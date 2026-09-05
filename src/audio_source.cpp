@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 
 #include "audio_frame.pb.h"
@@ -90,6 +91,9 @@ void AudioSource::clearQueue() {
 
 void AudioSource::captureFrame(const AudioFrame& frame, int timeout_ms) {
   using namespace std::chrono_literals;
+  if (timeout_ms < 0) {
+    throw std::invalid_argument("Audio capture timeout must be non-negative");
+  }
   if (!handle_) {
     return;
   }
@@ -121,7 +125,7 @@ void AudioSource::captureFrame(const AudioFrame& frame, int timeout_ms) {
   if (status == std::future_status::ready || status == std::future_status::deferred) {
     fut.get();
   } else { // std::future_status::timeout
-    LK_LOG_WARN("captureAudioFrameAsync timed out after {} ms", timeout_ms);
+    throw std::system_error(std::make_error_code(std::errc::timed_out), "Audio capture callback deadline exceeded");
   }
 }
 

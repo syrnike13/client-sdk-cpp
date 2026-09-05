@@ -16,6 +16,11 @@
 
 #pragma once
 
+// Downstream builds use this feature-test macro in #if/#ifdef expressions.
+// NOLINTNEXTLINE(modernize-macro-to-enum)
+#define LIVEKIT_CPP_HAS_PREENCODED_VIDEO_SOURCE 1
+
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -58,6 +63,20 @@ struct VideoCaptureOptions {
   std::optional<VideoFrameMetadata> metadata;
 };
 
+/// @brief One externally encoded H.264 access unit.
+struct EncodedVideoFrame {
+  /// Borrowed access-unit bytes, valid until captureFrame returns.
+  const std::uint8_t* data = nullptr;
+  /// Access-unit size in bytes.
+  std::size_t size = 0;
+  /// Capture timestamp in microseconds.
+  std::int64_t timestamp_us = 0;
+  /// Whether the access unit is an independently decodable key frame.
+  bool key_frame = false;
+  /// Optional packet-trailer metadata for this frame.
+  std::optional<VideoFrameMetadata> metadata;
+};
+
 /// Represents a real-time video source that can accept frames from the
 /// application and feed them into the LiveKit core.
 class LIVEKIT_API VideoSource {
@@ -94,10 +113,37 @@ public:
   void captureFrame(const VideoFrame& frame, std::int64_t timestamp_us = 0,
                     VideoRotation rotation = VideoRotation::VIDEO_ROTATION_0);
 
+protected:
+  VideoSource(int width, int height, bool pre_encoded);
+
 private:
   FfiHandle handle_; // owned FFI handle
   int width_{0};
   int height_{0};
+};
+
+/// @brief Video source that accepts externally encoded H.264 access units.
+///
+/// This source selects LiveKit's strict pass-through encoder backend. It never
+/// falls back to a raw-frame or software-encoding path.
+class LIVEKIT_API EncodedVideoSource final : public VideoSource {
+public:
+  /// @brief Create a fixed-resolution pre-encoded source.
+  /// @param width Width in pixels.
+  /// @param height Height in pixels.
+  /// @throws std::runtime_error if the FFI source cannot be created.
+  EncodedVideoSource(int width, int height);
+
+  /// @brief Submit one H.264 access unit synchronously.
+  /// @param frame Borrowed access-unit bytes and frame metadata.
+  /// @return Whether LiveKit accepted the access unit for delivery.
+  /// @throws std::invalid_argument if the payload is empty.
+  /// @throws std::runtime_error if the FFI request fails.
+  bool captureFrame(const EncodedVideoFrame& frame);
+
+  /// @brief Return and clear a pending PLI/FIR key-frame request.
+  /// @return Whether the application encoder must produce a key frame.
+  bool takeKeyFrameRequest();
 };
 
 } // namespace livekit

@@ -1,0 +1,1427 @@
+diff --git a/.changeset/preencoded-reference-continuity.md b/.changeset/preencoded-reference-continuity.md
+new file mode 100644
+index 00000000..d267a689
+--- /dev/null
++++ b/.changeset/preencoded-reference-continuity.md
+@@ -0,0 +1,11 @@
++---
++webrtc-sys: patch
++libwebrtc: patch
++livekit: patch
++livekit-ffi: patch
++---
++
++Fence pre-encoded reference continuity across WebRTC encoder-queue drops.
++The pass-through encoder requests a fresh keyframe and suppresses dependent
++access units until it arrives, instead of forwarding a damaged reference chain.
++Continuity is private to each encoder and resets on encoder/source replacement.
+diff --git a/.changeset/reused-screen-sender.md b/.changeset/reused-screen-sender.md
+new file mode 100644
+index 00000000..5896d522
+--- /dev/null
++++ b/.changeset/reused-screen-sender.md
+@@ -0,0 +1,11 @@
++---
++livekit: patch
++libwebrtc: patch
++webrtc-sys: patch
++livekit-ffi: patch
++---
++
++Keep the current track ID in publisher SDP when reusing an RTP sender for a
++replacement screen track. Return an absent track safely for inactive senders.
++This preserves bounded transceiver reuse while allowing the SFU to associate
++new RTP media with the replacement publication.
+diff --git a/libwebrtc/src/native/rtp_transceiver.rs b/libwebrtc/src/native/rtp_transceiver.rs
+index 3bd4fb59..a6a089bc 100644
+--- a/libwebrtc/src/native/rtp_transceiver.rs
++++ b/libwebrtc/src/native/rtp_transceiver.rs
+@@ -78,6 +78,12 @@ impl RtpTransceiver {
+         self.sys_handle.direction().into()
+     }
+ 
++    pub fn set_direction(&self, direction: RtpTransceiverDirection) -> Result<(), RtcError> {
++        self.sys_handle
++            .set_direction(direction.into())
++            .map_err(|e| unsafe { sys_err::ffi::RtcError::from(e.what()).into() })
++    }
++
+     pub fn sender(&self) -> rtp_sender::RtpSender {
+         rtp_sender::RtpSender { handle: RtpSender { sys_handle: self.sys_handle.sender() } }
+     }
+diff --git a/libwebrtc/src/rtp_sender.rs b/libwebrtc/src/rtp_sender.rs
+index 1bdf96ad..ca60a36c 100644
+--- a/libwebrtc/src/rtp_sender.rs
++++ b/libwebrtc/src/rtp_sender.rs
+@@ -98,3 +98,29 @@ impl Debug for RtpSender {
+         f.debug_struct("RtpReceiver").field("cname", &self.parameters().rtcp.cname).finish()
+     }
+ }
++
++#[cfg(all(test, not(target_arch = "wasm32")))]
++mod tests {
++    #[test]
++    fn inactive_sender_has_no_track() {
++        use crate::{
++            peer_connection_factory::PeerConnectionFactory,
++            rtp_transceiver::{RtpTransceiverDirection, RtpTransceiverInit},
++            MediaType,
++        };
++        let factory = PeerConnectionFactory::default();
++        let connection = factory.create_peer_connection(Default::default()).unwrap();
++        let transceiver = connection
++            .add_transceiver_for_media(
++                MediaType::Video,
++                RtpTransceiverInit {
++                    direction: RtpTransceiverDirection::RecvOnly,
++                    stream_ids: vec![],
++                    send_encodings: vec![],
++                },
++            )
++            .unwrap();
++        assert!(transceiver.sender().track().is_none());
++        connection.close();
++    }
++}
+diff --git a/libwebrtc/src/rtp_transceiver.rs b/libwebrtc/src/rtp_transceiver.rs
+index 00a7a919..b033b780 100644
+--- a/libwebrtc/src/rtp_transceiver.rs
++++ b/libwebrtc/src/rtp_transceiver.rs
+@@ -56,6 +56,10 @@ impl RtpTransceiver {
+         self.handle.direction()
+     }
+ 
++    pub fn set_direction(&self, direction: RtpTransceiverDirection) -> Result<(), RtcError> {
++        self.handle.set_direction(direction)
++    }
++
+     pub fn sender(&self) -> RtpSender {
+         self.handle.sender()
+     }
+diff --git a/livekit-ffi/protocol/ffi.proto b/livekit-ffi/protocol/ffi.proto
+index 53ea782b..74276479 100644
+--- a/livekit-ffi/protocol/ffi.proto
++++ b/livekit-ffi/protocol/ffi.proto
+@@ -89,6 +89,8 @@ message FfiRequest {
+     CaptureVideoFrameRequest capture_video_frame = 22;
+     VideoConvertRequest video_convert = 23;
+     VideoStreamFromParticipantRequest video_stream_from_participant = 24;
++    CaptureEncodedVideoFrameRequest capture_encoded_video_frame = 87;
++    TakeVideoKeyFrameRequestRequest take_video_key_frame_request = 88;
+ 
+     // Audio
+     NewAudioStreamRequest new_audio_stream = 25;
+@@ -184,7 +186,7 @@ message FfiRequest {
+     // Room event ready signal
+     ReadyForRoomEventRequest ready_for_room_event = 83;
+ 
+-    // NEXT_ID: 87
++    // NEXT_ID: 89
+   }
+ }
+ 
+@@ -221,6 +223,8 @@ message FfiResponse {
+     CaptureVideoFrameResponse capture_video_frame = 22;
+     VideoConvertResponse video_convert = 23;
+     VideoStreamFromParticipantResponse video_stream_from_participant = 24;
++    CaptureEncodedVideoFrameResponse capture_encoded_video_frame = 87;
++    TakeVideoKeyFrameRequestResponse take_video_key_frame_request = 88;
+ 
+     // Audio
+     NewAudioStreamResponse new_audio_stream = 25;
+@@ -313,7 +317,7 @@ message FfiResponse {
+     // Room event ready signal
+     ReadyForRoomEventResponse ready_for_room_event = 82;
+ 
+-    // NEXT_ID: 87
++    // NEXT_ID: 89
+   }
+ }
+ 
+diff --git a/livekit-ffi/protocol/room.proto b/livekit-ffi/protocol/room.proto
+index df08ed5b..ab1068a5 100644
+--- a/livekit-ffi/protocol/room.proto
++++ b/livekit-ffi/protocol/room.proto
+@@ -335,6 +335,7 @@ enum VideoEncoderBackend {
+   ENCODER_BACKEND_NVENC = 3;
+   ENCODER_BACKEND_VAAPI = 4;
+   ENCODER_BACKEND_VIDEOTOOLBOX = 5;
++  ENCODER_BACKEND_PRE_ENCODED = 6;
+ }
+ 
+ // Controls how the encoder degrades quality when bandwidth is constrained.
+diff --git a/livekit-ffi/protocol/video_frame.proto b/livekit-ffi/protocol/video_frame.proto
+index a4b610e0..eadb22ca 100644
+--- a/livekit-ffi/protocol/video_frame.proto
++++ b/livekit-ffi/protocol/video_frame.proto
+@@ -82,6 +82,22 @@ message CaptureVideoFrameRequest {
+ 
+ message CaptureVideoFrameResponse {}
+ 
++// Push one H.264 access unit to a pre-encoded VideoSource. The payload pointer
++// is borrowed only for the duration of the synchronous FFI request.
++message CaptureEncodedVideoFrameRequest {
++  required uint64 source_handle = 1;
++  required uint64 data_ptr = 2;
++  required uint64 data_size = 3;
++  required int64 timestamp_us = 4;
++  required bool key_frame = 5;
++  optional FrameMetadata metadata = 6;
++}
++
++message CaptureEncodedVideoFrameResponse { required bool accepted = 1; }
++
++message TakeVideoKeyFrameRequestRequest { required uint64 source_handle = 1; }
++message TakeVideoKeyFrameRequestResponse { required bool requested = 1; }
++
+ message VideoConvertRequest {
+   optional bool flip_y = 1;
+   required VideoBufferInfo buffer = 2;
+@@ -207,6 +223,7 @@ message VideoSourceResolution {
+ 
+ enum VideoSourceType {
+   VIDEO_SOURCE_NATIVE = 0;
++  VIDEO_SOURCE_NATIVE_ENCODED = 1;
+ }
+ 
+ message VideoSourceInfo {
+diff --git a/livekit-ffi/src/conversion/room.rs b/livekit-ffi/src/conversion/room.rs
+index 4922add5..281dcfc7 100644
+--- a/livekit-ffi/src/conversion/room.rs
++++ b/livekit-ffi/src/conversion/room.rs
+@@ -63,6 +63,9 @@ fn video_encoder_from_proto(backend: Option<i32>) -> Option<VideoEncoderBackend>
+         proto::VideoEncoderBackend::EncoderBackendVideotoolbox => {
+             Some(VideoEncoderBackend::VideoToolbox)
+         }
++        proto::VideoEncoderBackend::EncoderBackendPreEncoded => {
++            Some(VideoEncoderBackend::PreEncoded)
++        }
+     }
+ }
+ 
+@@ -447,6 +450,7 @@ mod tests {
+                 proto::VideoEncoderBackend::EncoderBackendVideotoolbox,
+                 VideoEncoderBackend::VideoToolbox,
+             ),
++            (proto::VideoEncoderBackend::EncoderBackendPreEncoded, VideoEncoderBackend::PreEncoded),
+         ];
+ 
+         for (proto_backend, expected) in cases {
+diff --git a/livekit-ffi/src/server/requests.rs b/livekit-ffi/src/server/requests.rs
+index 8ee56988..80b299b7 100644
+--- a/livekit-ffi/src/server/requests.rs
++++ b/livekit-ffi/src/server/requests.rs
+@@ -520,6 +520,27 @@ unsafe fn on_capture_video_frame(
+     Ok(proto::CaptureVideoFrameResponse::default())
+ }
+ 
++/// Push a pre-encoded access unit to a source.
++///
++/// # Safety
++/// The caller must keep the encoded payload pointer valid for this request.
++unsafe fn on_capture_encoded_video_frame(
++    server: &'static FfiServer,
++    push: proto::CaptureEncodedVideoFrameRequest,
++) -> FfiResult<proto::CaptureEncodedVideoFrameResponse> {
++    let source = server.retrieve_handle::<video_source::FfiVideoSource>(push.source_handle)?;
++    let accepted = source.capture_encoded_frame(push)?;
++    Ok(proto::CaptureEncodedVideoFrameResponse { accepted })
++}
++
++fn on_take_video_key_frame_request(
++    server: &'static FfiServer,
++    request: proto::TakeVideoKeyFrameRequestRequest,
++) -> FfiResult<proto::TakeVideoKeyFrameRequestResponse> {
++    let source = server.retrieve_handle::<video_source::FfiVideoSource>(request.source_handle)?;
++    Ok(proto::TakeVideoKeyFrameRequestResponse { requested: source.take_key_frame_request()? })
++}
++
+ /// Convert a video frame
+ ///
+ /// # Safety: The user must ensure that the pointers/len provided are valid
+@@ -1390,6 +1411,12 @@ pub fn handle_request(
+         }
+         Request::NewVideoSource(req) => on_new_video_source(server, req)?.into(),
+         Request::CaptureVideoFrame(req) => unsafe { on_capture_video_frame(server, req)?.into() },
++        Request::CaptureEncodedVideoFrame(req) => unsafe {
++            on_capture_encoded_video_frame(server, req)?.into()
++        },
++        Request::TakeVideoKeyFrameRequest(req) => {
++            on_take_video_key_frame_request(server, req)?.into()
++        }
+         Request::VideoConvert(req) => unsafe { on_video_convert(server, req)?.into() },
+         Request::NewAudioStream(req) => on_new_audio_stream(server, req)?.into(),
+         Request::NewAudioSource(req) => on_new_audio_source(server, req)?.into(),
+diff --git a/livekit-ffi/src/server/video_source.rs b/livekit-ffi/src/server/video_source.rs
+index ee1410a7..ab0284f6 100644
+--- a/livekit-ffi/src/server/video_source.rs
++++ b/livekit-ffi/src/server/video_source.rs
+@@ -16,9 +16,13 @@ use super::{colorcvt, FfiHandle};
+ use crate::{proto, server, FfiError, FfiHandleId, FfiResult};
+ use livekit::webrtc::{
+     prelude::*,
+-    video_frame::{FrameMetadata, VideoFrame},
++    video_frame::{
++        EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame, FrameMetadata, VideoFrame,
++    },
+ };
+ 
++const MAX_ENCODED_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
++
+ pub struct FfiVideoSource {
+     pub handle_id: FfiHandleId,
+     pub source_type: proto::VideoSourceType,
+@@ -58,6 +62,13 @@ impl FfiVideoSource {
+                     NativeVideoSource::new(new_source.resolution.into(), is_screencast);
+                 RtcVideoSource::Native(video_source)
+             }
++            #[cfg(not(target_arch = "wasm32"))]
++            proto::VideoSourceType::VideoSourceNativeEncoded => {
++                use livekit::webrtc::video_source::native::NativeVideoSource;
++
++                let video_source = NativeVideoSource::new_encoded(new_source.resolution.into());
++                RtcVideoSource::Native(video_source)
++            }
+             _ => return Err(FfiError::InvalidRequest("unsupported video source type".into())),
+         };
+ 
+@@ -94,6 +105,57 @@ impl FfiVideoSource {
+         }
+         Ok(())
+     }
++
++    /// Captures one externally encoded H.264 access unit.
++    ///
++    /// # Safety
++    /// `capture.data_ptr` must point to `capture.data_size` readable bytes for
++    /// the duration of this call.
++    pub unsafe fn capture_encoded_frame(
++        &self,
++        capture: proto::CaptureEncodedVideoFrameRequest,
++    ) -> FfiResult<bool> {
++        if self.source_type != proto::VideoSourceType::VideoSourceNativeEncoded {
++            return Err(FfiError::InvalidRequest("video source is not pre-encoded".into()));
++        }
++        let size = usize::try_from(capture.data_size)
++            .map_err(|_| FfiError::InvalidRequest("encoded frame size is invalid".into()))?;
++        if capture.data_ptr == 0 || size == 0 || size > MAX_ENCODED_ACCESS_UNIT_BYTES {
++            return Err(FfiError::InvalidRequest("encoded frame payload is invalid".into()));
++        }
++        let payload = std::slice::from_raw_parts(capture.data_ptr as *const u8, size);
++        match self.source {
++            #[cfg(not(target_arch = "wasm32"))]
++            RtcVideoSource::Native(ref source) => {
++                let resolution = source.video_resolution();
++                let accepted = source.capture_encoded_frame(&EncodedVideoFrame {
++                    codec: EncodedVideoCodec::H264,
++                    payload,
++                    timestamp_us: capture.timestamp_us,
++                    frame_type: if capture.key_frame {
++                        EncodedFrameType::Key
++                    } else {
++                        EncodedFrameType::Delta
++                    },
++                    resolution,
++                    frame_metadata: frame_metadata_from_proto(capture.metadata),
++                });
++                Ok(accepted)
++            }
++            _ => Err(FfiError::InvalidRequest("unsupported video source type".into())),
++        }
++    }
++
++    pub fn take_key_frame_request(&self) -> FfiResult<bool> {
++        if self.source_type != proto::VideoSourceType::VideoSourceNativeEncoded {
++            return Err(FfiError::InvalidRequest("video source is not pre-encoded".into()));
++        }
++        match self.source {
++            #[cfg(not(target_arch = "wasm32"))]
++            RtcVideoSource::Native(ref source) => Ok(source.take_keyframe_request()),
++            _ => Err(FfiError::InvalidRequest("unsupported video source type".into())),
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/livekit/src/room/e2ee/manager.rs b/livekit/src/room/e2ee/manager.rs
+index 5ee35cd3..ff3b7c8c 100644
+--- a/livekit/src/room/e2ee/manager.rs
++++ b/livekit/src/room/e2ee/manager.rs
+@@ -88,11 +88,14 @@ impl E2eeManager {
+     }
+ 
+     pub(crate) fn cleanup(&self) {
+-        let mut inner = self.inner.lock();
+-        for cryptor in inner.frame_cryptors.values() {
+-            cryptor.set_enabled(false);
++        {
++            let mut inner = self.inner.lock();
++            for cryptor in inner.frame_cryptors.values() {
++                cryptor.set_enabled(false);
++            }
++            inner.frame_cryptors.clear();
+         }
+-        inner.frame_cryptors.clear();
++        *self.state_changed.lock() = None;
+     }
+ 
+     /// Register to e2ee state changes
+@@ -383,4 +386,22 @@ mod tests {
+ 
+         assert!(needs_video_receiver_packet_trailer_handler(&features));
+     }
++
++    #[test]
++    fn cleanup_releases_state_changed_handler() {
++        let manager = E2eeManager::new(None, false);
++        let retained = Arc::new(());
++        let retained_weak = Arc::downgrade(&retained);
++        manager.on_state_changed({
++            let retained = retained.clone();
++            move |_, _| {
++                let _ = &retained;
++            }
++        });
++
++        drop(retained);
++        assert!(retained_weak.upgrade().is_some());
++        manager.cleanup();
++        assert!(retained_weak.upgrade().is_none());
++    }
+ }
+diff --git a/livekit/src/room/mod.rs b/livekit/src/room/mod.rs
+index b02d88e5..c00819f8 100644
+--- a/livekit/src/room/mod.rs
++++ b/livekit/src/room/mod.rs
+@@ -767,11 +767,13 @@ impl Room {
+ 
+         e2ee_manager.on_state_changed({
+             let dispatcher = dispatcher.clone();
+-            let inner = inner.clone();
++            let weak_inner = Arc::downgrade(&inner);
+             move |participant_identity, state| {
+                 // Forward e2ee events to the room
+                 // (Ignore if the participant is not in the room anymore)
+ 
++                let Some(inner) = weak_inner.upgrade() else { return };
++
+                 let participant = if participant_identity.as_str()
+                     == inner.local_participant.identity().as_str()
+                 {
+diff --git a/livekit/src/rtc_engine/peer_transport.rs b/livekit/src/rtc_engine/peer_transport.rs
+index 7eccd2ef..bff336e5 100644
+--- a/livekit/src/rtc_engine/peer_transport.rs
++++ b/livekit/src/rtc_engine/peer_transport.rs
+@@ -33,6 +33,7 @@ struct TransportInner {
+     single_pc_mode: bool,
+     // Publish-side target bitrate (bps) for offer munging
+     max_send_bitrate_bps: Option<u64>,
++    pre_encoded_video: bool,
+     pending_initial_offer: Option<SessionDescription>,
+ }
+ 
+@@ -65,6 +66,7 @@ impl PeerTransport {
+                 restarting_ice: false,
+                 single_pc_mode,
+                 max_send_bitrate_bps: None,
++                pre_encoded_video: false,
+                 pending_initial_offer: None,
+             })),
+         }
+@@ -185,7 +187,10 @@ impl PeerTransport {
+         if has_video {
+             let start_kbps = {
+                 let inner = self.inner.lock().await;
+-                Self::compute_start_bitrate_kbps(inner.max_send_bitrate_bps)
++                Self::compute_start_bitrate_kbps(
++                    inner.max_send_bitrate_bps,
++                    inner.pre_encoded_video,
++                )
+             };
+             if let Some(start_kbps) = start_kbps {
+                 log::info!("Initial offer: applying x-google-start-bitrate={} kbps", start_kbps);
+@@ -209,9 +214,10 @@ impl PeerTransport {
+         inner.pending_initial_offer = None;
+     }
+ 
+-    pub async fn set_max_send_bitrate_bps(&self, bps: Option<u64>) {
++    pub async fn set_max_send_bitrate_bps(&self, bps: Option<u64>, pre_encoded_video: bool) {
+         let mut inner = self.inner.lock().await;
+         inner.max_send_bitrate_bps = bps;
++        inner.pre_encoded_video = pre_encoded_video;
+     }
+ 
+     /// Maximum x-google-start-bitrate (kbps).
+@@ -220,9 +226,11 @@ impl PeerTransport {
+ 
+     /// Compute the x-google-start-bitrate value for SDP munging.
+     ///
+-    /// Returns min(90% of target, 1 Mbps). Returns None if no target bitrate is set
+-    /// (initial offer before track publish) or if the target is too low.
+-    fn compute_start_bitrate_kbps(target_bps: Option<u64>) -> Option<u32> {
++    /// Returns 90% of the target, capped at 1 Mbps for ordinary encoders. A
++    /// pre-encoded stream is not capped because its upstream encoder cannot
++    /// honor WebRTC's lower startup estimate. Returns `None` when no useful
++    /// target is available.
++    fn compute_start_bitrate_kbps(target_bps: Option<u64>, pre_encoded_video: bool) -> Option<u32> {
+         let target_bps = target_bps?;
+         let target_kbps = (target_bps / 1000) as u32;
+ 
+@@ -232,7 +240,9 @@ impl PeerTransport {
+ 
+         // Use 90% of target bitrate as start bitrate, capped at 1 Mbps
+         let start_kbps = (target_kbps as f64 * 0.9).round() as u32;
+-        Some(start_kbps.min(target_kbps).min(Self::MAX_START_BITRATE_KBPS))
++        let maximum_start_kbps =
++            if pre_encoded_video { target_kbps } else { Self::MAX_START_BITRATE_KBPS };
++        Some(start_kbps.min(target_kbps).min(maximum_start_kbps))
+     }
+ 
+     /// Munge SDP to change a=inactive to a=recvonly for RTP media m-lines in single PC mode.
+@@ -448,6 +458,50 @@ impl PeerTransport {
+         munged
+     }
+ 
++    // SetTrack reuses libwebrtc's sender ID, which remains the first track's
++    // ID. LiveKit AddTrack signals the current track ID. Keep both SDP MSID
++    // forms aligned with that current ID when reusing a publisher m-line.
++    fn munge_sender_track_ids(
++        sdp: &str,
++        tracks: &std::collections::HashMap<String, String>,
++    ) -> String {
++        let eol = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
++        let lines: Vec<&str> = sdp.lines().collect();
++        let mut out = Vec::with_capacity(lines.len());
++        let mut start = 0;
++        while start < lines.len() {
++            let end = (start + 1..lines.len())
++                .find(|&i| lines[i].starts_with("m="))
++                .unwrap_or(lines.len());
++            let track = lines[start..end]
++                .iter()
++                .find_map(|line| line.strip_prefix("a=mid:"))
++                .and_then(|mid| tracks.get(mid));
++            for line in &lines[start..end] {
++                let msid = if line.starts_with("a=msid:") {
++                    Some(7)
++                } else if line.starts_with("a=ssrc:") {
++                    line.find(" msid:").map(|i| i + 6)
++                } else {
++                    None
++                };
++                if let (Some(track), Some(offset)) = (track, msid) {
++                    if let Some(stream) = line[offset..].split_whitespace().next() {
++                        out.push(format!("{}{stream} {track}", &line[..offset]));
++                        continue;
++                    }
++                }
++                out.push((*line).to_owned());
++            }
++            start = end;
++        }
++        let mut result = out.join(eol);
++        if sdp.ends_with('\n') {
++            result.push_str(eol);
++        }
++        result
++    }
++
+     pub async fn create_and_send_offer(&self, options: OfferOptions) -> EngineResult<()> {
+         let mut inner = self.inner.lock().await;
+         if options.ice_restart {
+@@ -478,6 +532,21 @@ impl PeerTransport {
+ 
+         let mut offer = self.peer_connection.create_offer(options).await?;
+         let mut sdp = offer.to_string();
++        let tracks = self
++            .peer_connection
++            .transceivers()
++            .into_iter()
++            .filter_map(|transceiver| {
++                Some((transceiver.mid()?, transceiver.sender().track()?.id()))
++            })
++            .collect();
++        let current_ids = Self::munge_sender_track_ids(&sdp, &tracks);
++        if current_ids != sdp {
++            offer = SessionDescription::parse(&current_ids, offer.sdp_type()).map_err(|error| {
++                super::EngineError::Internal(format!("Invalid current-track SDP: {error}").into())
++            })?;
++            sdp = current_ids;
++        }
+ 
+         if inner.single_pc_mode {
+             // Fix inactive media m-lines to recvonly for single PC mode.
+@@ -511,14 +580,18 @@ impl PeerTransport {
+         }
+ 
+         // Apply x-google-start-bitrate for all video codecs to improve initial quality.
+-        // Uses min(90% of target, 1 Mbps) to prevent BWE from starting too aggressively.
++        // Raw encoders use a conservative ceiling; a pre-encoded stream starts near
++        // its declared fixed bitrate because it cannot honor a lower initial target.
+         let has_video = sdp.contains(" VP8/90000")
+             || sdp.contains(" VP9/90000")
+             || sdp.contains(" AV1/90000")
+             || sdp.contains(" H264/90000")
+             || sdp.contains(" H265/90000");
+         if has_video {
+-            if let Some(start_kbps) = Self::compute_start_bitrate_kbps(inner.max_send_bitrate_bps) {
++            if let Some(start_kbps) = Self::compute_start_bitrate_kbps(
++                inner.max_send_bitrate_bps,
++                inner.pre_encoded_video,
++            ) {
+                 log::info!(
+                     "Applying x-google-start-bitrate={} kbps (target_bps={:?})",
+                     start_kbps,
+@@ -552,8 +625,24 @@ impl PeerTransport {
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn reused_sender_msid_follows_current_track_and_preserves_receiver() {
++        let original = "v=0\r\nm=video 9 RTP/AVP 96\r\na=mid:8\r\na=msid:- old\r\na=ssrc:123 msid:- old\r\na=ssrc:124 msid:screen old\r\nm=audio 9 RTP/AVP 111\r\na=mid:9\r\na=msid:remote receiver\r\n";
++        let tracks = std::collections::HashMap::from([("8".to_owned(), "new".to_owned())]);
++        let expected = original.replace("- old", "- new").replace("screen old", "screen new");
++        assert_eq!(PeerTransport::munge_sender_track_ids(original, &tracks), expected);
++        assert_eq!(PeerTransport::munge_sender_track_ids(&expected, &tracks), expected);
++        assert_eq!(PeerTransport::munge_sender_track_ids(original, &Default::default()), original);
++    }
++
+     use super::PeerTransport;
+ 
++    #[test]
++    fn pre_encoded_video_uses_its_declared_start_bitrate() {
++        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(8_000_000), true), Some(7_200));
++        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(8_000_000), false), Some(1_000));
++    }
++
+     /// Reproduces the publisher-transport self-deadlock.
+     ///
+     /// `PeerTransport::set_remote_description` locks `self.inner` and then, when
+diff --git a/livekit/src/rtc_engine/rtc_events.rs b/livekit/src/rtc_engine/rtc_events.rs
+index a59aab58..7b51092e 100644
+--- a/livekit/src/rtc_engine/rtc_events.rs
++++ b/livekit/src/rtc_engine/rtc_events.rs
+@@ -26,6 +26,7 @@ use crate::{
+ };
+ 
+ pub type RtcEmitter = mpsc::UnboundedSender<RtcEvent>;
++pub type RtcWeakEmitter = mpsc::WeakUnboundedSender<RtcEvent>;
+ pub type RtcEvents = mpsc::UnboundedReceiver<RtcEvent>;
+ 
+ #[derive(Debug)]
+@@ -60,7 +61,6 @@ pub enum RtcEvent {
+     },
+     DataChannelBufferedAmountChange {
+         sent: u64,
+-        amount: u64,
+         kind: DataPacketKind,
+     },
+ }
+@@ -70,31 +70,37 @@ pub enum RtcEvent {
+ 
+ fn on_connection_state_change(
+     target: proto::SignalTarget,
+-    emitter: RtcEmitter,
++    emitter: RtcWeakEmitter,
+ ) -> rtc::peer_connection::OnConnectionChange {
+     Box::new(move |state| {
+-        let _ = emitter.send(RtcEvent::ConnectionChange { state, target });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::ConnectionChange { state, target });
++        }
+     })
+ }
+ 
+ fn on_ice_candidate(
+     target: proto::SignalTarget,
+-    emitter: RtcEmitter,
++    emitter: RtcWeakEmitter,
+ ) -> rtc::peer_connection::OnIceCandidate {
+     Box::new(move |ice_candidate| {
+-        let _ = emitter.send(RtcEvent::IceCandidate { ice_candidate, target });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::IceCandidate { ice_candidate, target });
++        }
+     })
+ }
+ 
+-fn on_offer(target: proto::SignalTarget, emitter: RtcEmitter) -> OnOfferCreated {
++fn on_offer(target: proto::SignalTarget, emitter: RtcWeakEmitter) -> OnOfferCreated {
+     Box::new(move |offer| {
+-        let _ = emitter.send(RtcEvent::Offer { offer, target });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::Offer { offer, target });
++        }
+     })
+ }
+ 
+ fn on_data_channel(
+     target: proto::SignalTarget,
+-    emitter: RtcEmitter,
++    emitter: RtcWeakEmitter,
+ ) -> rtc::peer_connection::OnDataChannel {
+     Box::new(move |data_channel| {
+         match data_channel.label().as_str() {
+@@ -106,24 +112,28 @@ fn on_data_channel(
+             }
+             _ => {}
+         }
+-        let _ = emitter.send(RtcEvent::DataChannel { data_channel, target });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::DataChannel { data_channel, target });
++        }
+     })
+ }
+ 
+-fn on_track(target: proto::SignalTarget, emitter: RtcEmitter) -> rtc::peer_connection::OnTrack {
++fn on_track(target: proto::SignalTarget, emitter: RtcWeakEmitter) -> rtc::peer_connection::OnTrack {
+     Box::new(move |event| {
+-        let _ = emitter.send(RtcEvent::Track {
+-            streams: event.streams,
+-            track: event.track,
+-            transceiver: event.transceiver,
+-            target,
+-        });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::Track {
++                streams: event.streams,
++                track: event.track,
++                transceiver: event.transceiver,
++                target,
++            });
++        }
+     })
+ }
+ 
+ fn on_ice_candidate_error(
+     _target: proto::SignalTarget,
+-    _emitter: RtcEmitter,
++    _emitter: RtcWeakEmitter,
+ ) -> rtc::peer_connection::OnIceCandidateError {
+     Box::new(move |ice_error| {
+         log::debug!("{:?}", ice_error);
+@@ -132,6 +142,7 @@ fn on_ice_candidate_error(
+ 
+ pub fn forward_pc_events(transport: &mut PeerTransport, rtc_emitter: RtcEmitter) {
+     let signal_target = transport.signal_target();
++    let rtc_emitter = rtc_emitter.downgrade();
+     transport
+         .peer_connection()
+         .on_ice_candidate(Some(on_ice_candidate(signal_target, rtc_emitter.clone())));
+@@ -154,28 +165,31 @@ pub fn forward_pc_events(transport: &mut PeerTransport, rtc_emitter: RtcEmitter)
+     transport.on_offer(Some(on_offer(signal_target, rtc_emitter)));
+ }
+ 
+-fn on_message(emitter: RtcEmitter, kind: DataPacketKind) -> rtc::data_channel::OnMessage {
++fn on_message(emitter: RtcWeakEmitter, kind: DataPacketKind) -> rtc::data_channel::OnMessage {
+     Box::new(move |buffer| {
+-        let _ = emitter.send(RtcEvent::Data {
+-            data: buffer.data.to_vec(),
+-            binary: buffer.binary,
+-            kind,
+-        });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::Data {
++                data: buffer.data.to_vec(),
++                binary: buffer.binary,
++                kind,
++            });
++        }
+     })
+ }
+ 
+ fn on_buffered_amount_change(
+-    emitter: RtcEmitter,
+-    dc: DataChannel,
++    emitter: RtcWeakEmitter,
+     kind: DataPacketKind,
+ ) -> rtc::data_channel::OnBufferedAmountChange {
+     Box::new(move |sent| {
+-        let amount = dc.buffered_amount();
+-        let _ = emitter.send(RtcEvent::DataChannelBufferedAmountChange { sent, amount, kind });
++        if let Some(emitter) = emitter.upgrade() {
++            let _ = emitter.send(RtcEvent::DataChannelBufferedAmountChange { sent, kind });
++        }
+     })
+ }
+ 
+ pub fn forward_dc_events(dc: &mut DataChannel, kind: DataPacketKind, rtc_emitter: RtcEmitter) {
++    let rtc_emitter = rtc_emitter.downgrade();
+     dc.on_message(Some(on_message(rtc_emitter.clone(), kind)));
+-    dc.on_buffered_amount_change(Some(on_buffered_amount_change(rtc_emitter, dc.clone(), kind)));
++    dc.on_buffered_amount_change(Some(on_buffered_amount_change(rtc_emitter, kind)));
+ }
+diff --git a/livekit/src/rtc_engine/rtc_session.rs b/livekit/src/rtc_engine/rtc_session.rs
+index bb6c45f3..bc9a6da1 100644
+--- a/livekit/src/rtc_engine/rtc_session.rs
++++ b/livekit/src/rtc_engine/rtc_session.rs
+@@ -379,6 +379,8 @@ struct SessionInner {
+     dispatched_streams: Mutex<HashSet<(String, String)>>,
+ 
+     pending_tracks: Mutex<HashMap<String, oneshot::Sender<proto::TrackInfo>>>,
++    published_transceivers: Mutex<HashMap<String, PublishedTransceiver>>,
++    reusable_transceivers: Mutex<HashMap<TransceiverReuseKey, Vec<RtpTransceiver>>>,
+ 
+     // Publisher data channels
+     // used to send data to other participants (The SFU forwards the messages)
+@@ -449,6 +451,62 @@ struct SessionInner {
+     pc_state_notify: Notify,
+ }
+ 
++struct PublishedTransceiver {
++    transceiver: RtpTransceiver,
++    reuse_key: TransceiverReuseKey,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++struct TransceiverReuseKey {
++    video: bool,
++    encoding_rids: Vec<String>,
++}
++
++fn restore_transceiver(
++    transceiver: &RtpTransceiver,
++    track: &LocalTrack,
++    encodings: &[RtpEncodingParameters],
++) -> bool {
++    let sender = transceiver.sender();
++
++    if !encodings.is_empty() {
++        let mut parameters = sender.parameters();
++        if parameters.encodings.len() != encodings.len() {
++            log::warn!(
++                "cannot reuse RTP transceiver: encoding count changed from {} to {}",
++                parameters.encodings.len(),
++                encodings.len()
++            );
++            return false;
++        }
++
++        for (current, requested) in parameters.encodings.iter_mut().zip(encodings) {
++            current.active = requested.active;
++            current.max_bitrate = requested.max_bitrate;
++            current.max_framerate = requested.max_framerate;
++            current.priority = requested.priority;
++            current.scale_resolution_down_by = requested.scale_resolution_down_by;
++            current.scalability_mode.clone_from(&requested.scalability_mode);
++        }
++
++        if let Err(error) = sender.set_parameters(parameters) {
++            log::warn!("failed to restore RTP encoding parameters: {error:?}");
++            return false;
++        }
++    }
++
++    if let Err(error) = sender.set_track(Some(track.rtc_track())) {
++        log::warn!("failed to restore track on reusable RTP sender: {error:?}");
++        return false;
++    }
++    if let Err(error) = transceiver.set_direction(RtpTransceiverDirection::SendOnly) {
++        log::warn!("failed to restore reusable RTP transceiver direction: {error:?}");
++        return false;
++    }
++
++    true
++}
++
+ /// Information about the local participant needed for outgoing
+ /// data packets.
+ struct SessionParticipantInfo {
+@@ -474,6 +532,10 @@ impl SessionParticipantInfo {
+ pub struct RtcSession {
+     inner: Arc<SessionInner>,
+     handle: Mutex<Option<SessionHandle>>,
++    // WebRTC callbacks keep only weak senders so they cannot retain the RTC
++    // event queue after the session is dropped. This guard owns the sender for
++    // exactly the outer session lifetime.
++    _rtc_emitter: rtc_events::RtcEmitter,
+ }
+ 
+ impl Debug for RtcSession {
+@@ -601,7 +663,11 @@ impl RtcSession {
+             rtc_events::forward_pc_events(sub_pc, rtc_emitter.clone());
+         }
+         rtc_events::forward_dc_events(&mut lossy_dc, DataPacketKind::Lossy, rtc_emitter.clone());
+-        rtc_events::forward_dc_events(&mut reliable_dc, DataPacketKind::Reliable, rtc_emitter);
++        rtc_events::forward_dc_events(
++            &mut reliable_dc,
++            DataPacketKind::Reliable,
++            rtc_emitter.clone(),
++        );
+ 
+         let (close_tx, close_rx) = watch::channel(false);
+ 
+@@ -622,6 +688,8 @@ impl RtcSession {
+             mid_to_track_id: Mutex::new(HashMap::new()),
+             dispatched_streams: Mutex::new(HashSet::new()),
+             pending_tracks: Default::default(),
++            published_transceivers: Default::default(),
++            reusable_transceivers: Default::default(),
+             lossy_dc,
+             lossy_dc_buffered_amount_low_threshold: AtomicU64::new(
+                 INITIAL_BUFFERED_AMOUNT_LOW_THRESHOLD,
+@@ -707,7 +775,7 @@ impl RtcSession {
+             inner.publisher_negotiation_needed();
+         }
+ 
+-        Ok((Self { inner, handle }, join_response, session_events))
++        Ok((Self { inner, handle, _rtc_emitter: rtc_emitter }, join_response, session_events))
+     }
+ 
+     fn create_data_channels(
+@@ -1666,7 +1734,7 @@ impl SessionInner {
+                     );
+                 }
+             }
+-            RtcEvent::DataChannelBufferedAmountChange { sent, amount: _, kind } => {
++            RtcEvent::DataChannelBufferedAmountChange { sent, kind } => {
+                 let ev = DataChannelEvent {
+                     kind,
+                     detail: DataChannelEventDetail::BufferedAmountChange(sent),
+@@ -1875,13 +1943,24 @@ impl SessionInner {
+     }
+ 
+     fn remove_track(&self, sender: RtpSender) -> EngineResult<()> {
+-        if let Some(track) = sender.track() {
++        let track_id = sender.track().map(|track| track.id());
++        if let Some(track_id) = track_id.as_ref() {
+             let mut pending_tracks = self.pending_tracks.lock();
+-            pending_tracks.remove(&track.id());
++            pending_tracks.remove(track_id);
+         }
+ 
+         self.publisher_pc.peer_connection().remove_track(sender)?;
+ 
++        if let Some(track_id) = track_id {
++            if let Some(published) = self.published_transceivers.lock().remove(&track_id) {
++                self.reusable_transceivers
++                    .lock()
++                    .entry(published.reuse_key)
++                    .or_default()
++                    .push(published.transceiver);
++            }
++        }
++
+         Ok(())
+     }
+ 
+@@ -1904,17 +1983,37 @@ impl SessionInner {
+                 let sum: u64 = encodings.iter().filter_map(|e| e.max_bitrate).sum();
+                 (sum > 0).then_some(sum)
+             };
+-            self.publisher_pc.set_max_send_bitrate_bps(ultimate_bps).await;
++            self.publisher_pc
++                .set_max_send_bitrate_bps(
++                    ultimate_bps,
++                    options.video_encoder == VideoEncoderBackend::PreEncoded,
++                )
++                .await;
+         }
+ 
+-        let init = RtpTransceiverInit {
+-            direction: RtpTransceiverDirection::SendOnly,
+-            stream_ids: Default::default(),
+-            send_encodings: encodings,
++        let track_id = track.rtc_track().id();
++        let reuse_key = TransceiverReuseKey {
++            video: track.kind() == TrackKind::Video,
++            encoding_rids: encodings.iter().map(|encoding| encoding.rid.clone()).collect(),
++        };
++        let reusable = {
++            let mut pool = self.reusable_transceivers.lock();
++            let candidate = pool.get_mut(&reuse_key).and_then(Vec::pop);
++            if pool.get(&reuse_key).is_some_and(Vec::is_empty) {
++                pool.remove(&reuse_key);
++            }
++            candidate
++        };
++        let transceiver = if let Some(reusable) = reusable {
++            if restore_transceiver(&reusable, &track, &encodings) {
++                reusable
++            } else {
++                let _ = reusable.stop();
++                self.add_sender_transceiver(&track, encodings)?
++            }
++        } else {
++            self.add_sender_transceiver(&track, encodings)?
+         };
+-
+-        let transceiver =
+-            self.publisher_pc.peer_connection().add_transceiver(track.rtc_track(), init)?;
+ 
+         if track.kind() == TrackKind::Video {
+             transceiver.sender().set_video_encoder_backend(options.video_encoder);
+@@ -1952,9 +2051,29 @@ impl SessionInner {
+             transceiver.set_codec_preferences(matched)?;
+         }
+ 
++        self.published_transceivers
++            .lock()
++            .insert(track_id, PublishedTransceiver { transceiver: transceiver.clone(), reuse_key });
++
+         Ok(transceiver)
+     }
+ 
++    fn add_sender_transceiver(
++        &self,
++        track: &LocalTrack,
++        encodings: Vec<RtpEncodingParameters>,
++    ) -> EngineResult<RtpTransceiver> {
++        let init = RtpTransceiverInit {
++            direction: RtpTransceiverDirection::SendOnly,
++            stream_ids: Default::default(),
++            send_encodings: encodings,
++        };
++        self.publisher_pc
++            .peer_connection()
++            .add_transceiver(track.rtc_track(), init)
++            .map_err(Into::into)
++    }
++
+     /// Called when the SignalClient or one of the PeerConnection has lost the connection
+     /// The RTCEngine may try a reconnect.
+     fn on_session_disconnected(
+@@ -2573,7 +2692,9 @@ make_rtc_config!(make_rtc_config_reconnect, proto::ReconnectResponse);
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{parse_sdp_max_message_size, DEFAULT_MAX_MESSAGE_SIZE};
++    use std::collections::HashMap;
++
++    use super::{parse_sdp_max_message_size, TransceiverReuseKey, DEFAULT_MAX_MESSAGE_SIZE};
+ 
+     #[test]
+     fn parses_max_message_size_from_application_section() {
+@@ -2613,4 +2734,36 @@ mod tests {
+         assert_eq!(parse_sdp_max_message_size("a=max-message-size:abc\r\n"), None);
+         assert_eq!(parse_sdp_max_message_size("a=max-message-size:\r\n"), None);
+     }
++
++    #[test]
++    fn transceiver_reuse_key_matches_same_media_kind_and_ordered_rids() {
++        let key = TransceiverReuseKey {
++            video: true,
++            encoding_rids: vec!["f".into(), "h".into(), "q".into()],
++        };
++        let same = TransceiverReuseKey {
++            video: true,
++            encoding_rids: vec!["f".into(), "h".into(), "q".into()],
++        };
++
++        assert_eq!(key, same);
++        let mut pool = HashMap::new();
++        pool.insert(key, "candidate");
++        assert_eq!(pool.get(&same), Some(&"candidate"));
++    }
++
++    #[test]
++    fn transceiver_reuse_key_separates_media_kind_and_rid_layout() {
++        let video =
++            TransceiverReuseKey { video: true, encoding_rids: vec!["f".into(), "h".into()] };
++        let audio =
++            TransceiverReuseKey { video: false, encoding_rids: vec!["f".into(), "h".into()] };
++        let reversed =
++            TransceiverReuseKey { video: true, encoding_rids: vec!["h".into(), "f".into()] };
++        let different_rids = TransceiverReuseKey { video: true, encoding_rids: vec!["f".into()] };
++
++        assert_ne!(video, audio);
++        assert_ne!(video, reversed);
++        assert_ne!(video, different_rids);
++    }
+ }
+diff --git a/webrtc-sys/include/livekit/encoded_reference_continuity.h b/webrtc-sys/include/livekit/encoded_reference_continuity.h
+new file mode 100644
+index 00000000..d71b0f0e
+--- /dev/null
++++ b/webrtc-sys/include/livekit/encoded_reference_continuity.h
+@@ -0,0 +1,50 @@
++/*
++ * Copyright 2026 LiveKit, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#pragma once
++
++#include <cstdint>
++
++namespace livekit {
++
++// Encoder-queue drops are safe for raw frames, but break pre-encoded
++// references. This state belongs to one pass-through encoder, not the shared
++// capture source.
++class EncodedReferenceContinuity {
++ public:
++  [[nodiscard]] bool admit(std::uint64_t sequence, bool keyframe) noexcept {
++    if (sequence == 0 || sequence <= last_sequence_) {
++      waiting_for_keyframe_ = true;
++      return false;
++    }
++    const bool consecutive = sequence - last_sequence_ == 1;
++    last_sequence_ = sequence;
++    if (keyframe) {
++      waiting_for_keyframe_ = false;
++      return true;
++    }
++    if (!consecutive)
++      waiting_for_keyframe_ = true;
++    return !waiting_for_keyframe_;
++  }
++
++  void invalidate() noexcept { waiting_for_keyframe_ = true; }
++
++ private:
++  std::uint64_t last_sequence_ = 0;
++  bool waiting_for_keyframe_ = true;
++};
++
++}  // namespace livekit
+diff --git a/webrtc-sys/include/livekit/encoded_video_frame_buffer.h b/webrtc-sys/include/livekit/encoded_video_frame_buffer.h
+index 40e5fece..f0e7c560 100644
+--- a/webrtc-sys/include/livekit/encoded_video_frame_buffer.h
++++ b/webrtc-sys/include/livekit/encoded_video_frame_buffer.h
+@@ -89,6 +89,13 @@ class EncodedVideoFrameBuffer : public webrtc::VideoFrameBuffer {
+   EncodedVideoCodec codec() const { return codec_; }
+   EncodedFrameType frame_type() const { return frame_type_; }
+ 
++  // Assigned by the source before publishing this immutable frame to sinks.
++  void set_capture_sequence(uint64_t sequence) { capture_sequence_ = sequence; }
++  uint64_t capture_sequence() const { return capture_sequence_; }
++  const std::shared_ptr<std::atomic<bool>>& source_identity() const {
++    return keyframe_request_flag_;
++  }
++
+   // The encoded access unit. Shared with the pass-through encoder so the
+   // payload is not copied again on the send path.
+   webrtc::scoped_refptr<webrtc::EncodedImageBuffer> encoded_data() const {
+@@ -111,6 +118,7 @@ class EncodedVideoFrameBuffer : public webrtc::VideoFrameBuffer {
+   int height_;
+   EncodedVideoCodec codec_;
+   EncodedFrameType frame_type_;
++  uint64_t capture_sequence_ = 0;
+   webrtc::scoped_refptr<webrtc::EncodedImageBuffer> payload_;
+   std::shared_ptr<std::atomic<bool>> keyframe_request_flag_;
+   std::shared_ptr<EncodedRateControlState> rate_control_state_;
+diff --git a/webrtc-sys/include/livekit/video_track.h b/webrtc-sys/include/livekit/video_track.h
+index 21337794..042ee055 100644
+--- a/webrtc-sys/include/livekit/video_track.h
++++ b/webrtc-sys/include/livekit/video_track.h
+@@ -21,8 +21,8 @@
+ 
+ #include "api/media_stream_interface.h"
+ #include "api/video/video_frame.h"
+-#include "livekit/helper.h"
+ #include "livekit/encoded_video_frame_buffer.h"
++#include "livekit/helper.h"
+ #include "livekit/media_stream_track.h"
+ #include "livekit/video_frame.h"
+ #include "livekit/webrtc.h"
+@@ -91,9 +91,9 @@ class VideoTrackSource {
+   class InternalSource : public webrtc::AdaptedVideoTrackSource {
+    public:
+     InternalSource(const VideoResolution& resolution,
+-                   bool is_screencast);  // (0, 0) means no resolution/optional, the
+-                                         // source will guess the resolution at the
+-                                         // first captured frame
++                   bool is_screencast);  // (0, 0) means no resolution/optional,
++                                         // the source will guess the resolution
++                                         // at the first captured frame
+     ~InternalSource() override;
+ 
+     bool is_screencast() const override;
+@@ -120,6 +120,7 @@ class VideoTrackSource {
+    private:
+     mutable webrtc::Mutex mutex_;
+     webrtc::TimestampAligner timestamp_aligner_;
++    uint64_t encoded_capture_sequence_ = 0;
+     VideoResolution resolution_;
+     std::shared_ptr<PacketTrailerHandler> packet_trailer_handler_;
+     std::shared_ptr<std::atomic<bool>> keyframe_request_flag_ =
+@@ -170,7 +171,8 @@ class VideoTrackSource {
+ };
+ 
+ std::shared_ptr<VideoTrackSource> new_video_track_source(
+-    const VideoResolution& resolution, bool is_screencast);
++    const VideoResolution& resolution,
++    bool is_screencast);
+ 
+ static std::shared_ptr<MediaStreamTrack> video_to_media(
+     std::shared_ptr<VideoTrack> track) {
+diff --git a/webrtc-sys/src/passthrough_video_encoder.cpp b/webrtc-sys/src/passthrough_video_encoder.cpp
+index cd45b9e3..15fab01e 100644
+--- a/webrtc-sys/src/passthrough_video_encoder.cpp
++++ b/webrtc-sys/src/passthrough_video_encoder.cpp
+@@ -26,12 +26,13 @@
+ 
+ #include "absl/container/inlined_vector.h"
+ #include "api/video/encoded_image.h"
+-#include "api/video/video_frame.h"
+ #include "api/video/video_codec_constants.h"
++#include "api/video/video_frame.h"
+ #include "api/video_codecs/scalability_mode.h"
+ #include "api/video_codecs/video_encoder.h"
+ #include "av1_bitstream.h"
+ #include "common_video/h264/h264_common.h"
++#include "livekit/encoded_reference_continuity.h"
+ #include "livekit/encoded_video_frame_buffer.h"
+ #include "media/base/media_constants.h"
+ #include "modules/video_coding/include/video_codec_interface.h"
+@@ -193,6 +194,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+       return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+     }
+     codec_ = *codec_settings;
++    reference_continuity_ = {};
++    source_identity_.reset();
+     cached_sequence_header_obu_.clear();
+     av1_svc_controller_ = ScalableVideoControllerNoLayering();
+     if (IsAv1Codec(codec_type_) && !codec_.GetScalabilityMode().has_value()) {
+@@ -215,8 +218,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+   int32_t Encode(const VideoFrame& frame,
+                  const std::vector<VideoFrameType>* frame_types) override {
+     if (!encoded_image_callback_) {
+-      RTC_LOG(LS_ERROR)
+-          << "PassthroughVideoEncoder callback is not registered";
++      RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder callback is not registered";
+       return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+     }
+ 
+@@ -268,8 +270,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+       livekit::av1::NormalizeForRtp(&payload);
+ 
+       std::vector<uint8_t> sequence_header;
+-      if (livekit::av1::ExtractSequenceHeaderObu(
+-              payload.data(), payload.size(), &sequence_header)) {
++      if (livekit::av1::ExtractSequenceHeaderObu(payload.data(), payload.size(),
++                                                 &sequence_header)) {
+         cached_sequence_header_obu_ = std::move(sequence_header);
+       } else if (is_keyframe && !cached_sequence_header_obu_.empty()) {
+         livekit::av1::EnsureSequenceHeaderOnKeyframe(
+@@ -287,6 +289,20 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+       encoded_data = encoded_buffer->encoded_data();
+     }
+ 
++    if (source_identity_ != encoded_buffer->source_identity()) {
++      source_identity_ = encoded_buffer->source_identity();
++      reference_continuity_ = {};
++    }
++    if (!reference_continuity_.admit(encoded_buffer->capture_sequence(),
++                                     is_keyframe)) {
++      // A previous access unit can be discarded by WebRTC before Encode().
++      // Forwarding its dependent frames would corrupt every receiver until IDR.
++      encoded_buffer->request_keyframe();
++      encoded_image_callback_->OnDroppedFrame(
++          EncodedImageCallback::DropReason::kDroppedByEncoder);
++      return WEBRTC_VIDEO_CODEC_OK;
++    }
++
+     EncodedImage encoded_image;
+     encoded_image._encodedWidth = encoded_buffer->width();
+     encoded_image._encodedHeight = encoded_buffer->height();
+@@ -297,7 +313,8 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+     encoded_image.rotation_ = frame.rotation();
+     encoded_image.content_type_ = webrtc::VideoContentType::UNSPECIFIED;
+     encoded_image.timing_.flags = webrtc::VideoSendTiming::kInvalid;
+-    encoded_image._frameType = FrameTypeFromBuffer(encoded_buffer->frame_type());
++    encoded_image._frameType =
++        FrameTypeFromBuffer(encoded_buffer->frame_type());
+     encoded_image.SetColorSpace(frame.color_space());
+     const size_t encoded_size = encoded_data->size();
+     encoded_image.SetEncodedData(std::move(encoded_data));
+@@ -306,13 +323,15 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+ 
+     CodecSpecificInfo codec_info;
+     codec_info.codecSpecific = {};
+-    FillSingleLayerCodecSpecific(&codec_info, codec_type_, encoded_buffer->width(),
+-                                 encoded_buffer->height(), is_keyframe,
+-                                 &av1_svc_controller_);
++    FillSingleLayerCodecSpecific(
++        &codec_info, codec_type_, encoded_buffer->width(),
++        encoded_buffer->height(), is_keyframe, &av1_svc_controller_);
+ 
+     const auto result =
+         encoded_image_callback_->OnEncodedImage(encoded_image, &codec_info);
+     if (result.error != EncodedImageCallback::Result::OK) {
++      reference_continuity_.invalidate();
++      encoded_buffer->request_keyframe();
+       RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder callback failed "
+                         << result.error;
+       return WEBRTC_VIDEO_CODEC_ERROR;
+@@ -331,6 +350,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+     info.supports_native_handle = true;
+     info.implementation_name = "LiveKit pre-encoded passthrough";
+     info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
++    info.has_trusted_rate_controller = true;
+     info.is_hardware_accelerated = false;
+     info.supports_simulcast = false;
+     info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNative};
+@@ -338,8 +358,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+   }
+ 
+  private:
+-  void ForwardPendingRateControl(
+-      EncodedVideoFrameBuffer* encoded_buffer) {
++  void ForwardPendingRateControl(EncodedVideoFrameBuffer* encoded_buffer) {
+     std::optional<livekit::EncodedRateControlRequest> request;
+     {
+       webrtc::MutexLock lock(&rate_control_mutex_);
+@@ -357,10 +376,13 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+   VideoCodecType codec_type_;
+   VideoCodec codec_;
+   EncodedImageCallback* encoded_image_callback_ = nullptr;
++  livekit::EncodedReferenceContinuity reference_continuity_;
++  std::shared_ptr<std::atomic<bool>> source_identity_;
+   ScalableVideoControllerNoLayering av1_svc_controller_;
+   std::vector<uint8_t> cached_sequence_header_obu_;
+   webrtc::Mutex rate_control_mutex_;
+-  std::optional<livekit::EncodedRateControlRequest> latest_rate_control_request_;
++  std::optional<livekit::EncodedRateControlRequest>
++      latest_rate_control_request_;
+ };
+ 
+ }  // namespace
+@@ -388,8 +410,8 @@ PassthroughVideoEncoderFactory::GetSupportedFormats() const {
+   return supported_formats_;
+ }
+ 
+-std::vector<SdpVideoFormat>
+-PassthroughVideoEncoderFactory::GetImplementations() const {
++std::vector<SdpVideoFormat> PassthroughVideoEncoderFactory::GetImplementations()
++    const {
+   return supported_formats_;
+ }
+ 
+diff --git a/webrtc-sys/src/rtp_sender.cpp b/webrtc-sys/src/rtp_sender.cpp
+index e97bed2d..24ae4db9 100644
+--- a/webrtc-sys/src/rtp_sender.cpp
++++ b/webrtc-sys/src/rtp_sender.cpp
+@@ -153,7 +153,9 @@ bool RtpSender::set_track(std::shared_ptr<MediaStreamTrack> track) const {
+ }
+ 
+ std::shared_ptr<MediaStreamTrack> RtpSender::track() const {
+-  return rtc_runtime_->get_or_create_media_stream_track(sender_->track());
++  auto track = sender_->track();
++  if (!track) return nullptr;
++  return rtc_runtime_->get_or_create_media_stream_track(track);
+ }
+ 
+ uint32_t RtpSender::ssrc() const {
+diff --git a/webrtc-sys/src/video_track.cpp b/webrtc-sys/src/video_track.cpp
+index ba89c298..333a890f 100644
+--- a/webrtc-sys/src/video_track.cpp
++++ b/webrtc-sys/src/video_track.cpp
+@@ -56,7 +56,8 @@ livekit::EncodedVideoCodec ToNativeEncodedCodec(EncodedVideoCodec codec) {
+   }
+ }
+ 
+-livekit::EncodedFrameType ToNativeEncodedFrameType(EncodedFrameType frame_type) {
++livekit::EncodedFrameType ToNativeEncodedFrameType(
++    EncodedFrameType frame_type) {
+   switch (frame_type) {
+     case EncodedFrameType::Key:
+       return livekit::EncodedFrameType::kKey;
+@@ -80,9 +81,10 @@ VideoTrack::~VideoTrack() {
+ 
+ void VideoTrack::add_sink(const std::shared_ptr<NativeVideoSink>& sink) const {
+   webrtc::MutexLock lock(&mutex_);
+-  track()->AddOrUpdateSink(sink.get(),
+-                           webrtc::VideoSinkWants());  // TODO(theomonnom): Expose
+-                                                    // VideoSinkWants to Rust?
++  track()->AddOrUpdateSink(
++      sink.get(),
++      webrtc::VideoSinkWants());  // TODO(theomonnom): Expose
++                                  // VideoSinkWants to Rust?
+   sinks_.push_back(sink);
+ }
+ 
+@@ -137,8 +139,11 @@ std::shared_ptr<NativeVideoSink> new_native_video_sink(
+ }
+ 
+ VideoTrackSource::InternalSource::InternalSource(
+-    const VideoResolution& resolution, bool is_screencast)
+-    : webrtc::AdaptedVideoTrackSource(4), resolution_(resolution), is_screencast_(is_screencast) {}
++    const VideoResolution& resolution,
++    bool is_screencast)
++    : webrtc::AdaptedVideoTrackSource(4),
++      resolution_(resolution),
++      is_screencast_(is_screencast) {}
+ 
+ VideoTrackSource::InternalSource::~InternalSource() {}
+ 
+@@ -195,12 +200,13 @@ bool VideoTrackSource::InternalSource::on_captured_frame(
+   // Pre-encoded access units bypass the adapter entirely: frame-rate and
+   // resolution adaptation operate on raw frames, and dropping or scaling an
+   // encoded delta frame would corrupt the bitstream for every receiver.
+-  if (livekit::EncodedVideoFrameBuffer::FromNative(buffer.get())) {
++  if (auto* encoded =
++          livekit::EncodedVideoFrameBuffer::FromNative(buffer.get())) {
++    encoded->set_capture_sequence(++encoded_capture_sequence_);
+     if (packet_trailer_handler_) {
+       packet_trailer_handler_->emit_publish_timing(
+           VideoPublishTimingStage::EncoderUpload,
+-          frame_metadata.has_packet_trailer ? frame_metadata.user_timestamp
+-                                            : 0,
++          frame_metadata.has_packet_trailer ? frame_metadata.user_timestamp : 0,
+           frame_metadata.has_packet_trailer ? frame_metadata.frame_id : 0);
+     }
+     OnFrame(webrtc::VideoFrame::Builder()
+@@ -252,7 +258,8 @@ void VideoTrackSource::InternalSource::set_packet_trailer_handler(
+   packet_trailer_handler_ = std::move(handler);
+ }
+ 
+-VideoTrackSource::VideoTrackSource(const VideoResolution& resolution, bool is_screencast) {
++VideoTrackSource::VideoTrackSource(const VideoResolution& resolution,
++                                   bool is_screencast) {
+   source_ = webrtc::make_ref_counted<InternalSource>(resolution, is_screencast);
+ }
+ 
+@@ -267,12 +274,13 @@ bool VideoTrackSource::on_captured_frame(
+   return source_->on_captured_frame(rtc_frame, frame_metadata);
+ }
+ 
+-bool VideoTrackSource::capture_dmabuf_frame(int dmabuf_fd,
+-                                            int width,
+-                                            int height,
+-                                            int pixel_format,
+-                                            int64_t timestamp_us,
+-                                            const FrameMetadata& frame_metadata) const {
++bool VideoTrackSource::capture_dmabuf_frame(
++    int dmabuf_fd,
++    int width,
++    int height,
++    int pixel_format,
++    int64_t timestamp_us,
++    const FrameMetadata& frame_metadata) const {
+   auto dmabuf_pixel_format =
+       static_cast<livekit::DmaBufPixelFormat>(pixel_format);
+   auto buffer = webrtc::make_ref_counted<livekit::DmaBufVideoFrameBuffer>(
+@@ -324,9 +332,8 @@ bool VideoTrackSource::take_keyframe_request() const {
+ 
+ EncodedRateControlRequest VideoTrackSource::take_rate_control_request() const {
+   auto request = source_->rate_control_state()->Take();
+-  return EncodedRateControlRequest{request.has_request,
+-                                   request.target_bitrate_bps,
+-                                   request.framerate_fps};
++  return EncodedRateControlRequest{
++      request.has_request, request.target_bitrate_bps, request.framerate_fps};
+ }
+ 
+ void VideoTrackSource::set_packet_trailer_handler(
+@@ -340,7 +347,8 @@ webrtc::scoped_refptr<VideoTrackSource::InternalSource> VideoTrackSource::get()
+ }
+ 
+ std::shared_ptr<VideoTrackSource> new_video_track_source(
+-    const VideoResolution& resolution, bool is_screencast) {
++    const VideoResolution& resolution,
++    bool is_screencast) {
+   return std::make_shared<VideoTrackSource>(resolution, is_screencast);
+ }
+ 

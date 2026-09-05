@@ -20,6 +20,13 @@ The shared configuration and tooling scripts come from the
 > does, so manual invocation is possible. `clang-format` similarly needs to be
 > installed and run manually on Windows, pointing at the root `.clang-format`.
 
+For a Windows Ninja build, run `set CMAKE_GENERATOR=Ninja` in an x64 Visual
+Studio developer command prompt, then `build.cmd release-tests`. Set
+`VCPKG_ROOT` for a fresh build, or reuse a build directory already configured
+with the vcpkg toolchain. This emits `build-release/compile_commands.json` for
+manual `clang-tidy -p build-release <source>` runs. Use a separate build
+directory or move the existing build directory aside before changing generators.
+
 ### Install
 
 **macOS:**

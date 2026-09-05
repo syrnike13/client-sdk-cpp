@@ -362,14 +362,31 @@ jobs:
         if: matrix.e2e-testing && (inputs.integration_repeat > 0 || inputs.run_stress_tests)
         shell: bash
         env:
-          # Windows installs lk via `gh api` / `gh release download`, which need this env var
+            # macOS and Windows use official prebuilt CLI release assets.
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             curl -sSL https://get.livekit.io/cli | bash
-          elif [[ "$RUNNER_OS" == "macOS" ]]; then
-            brew install livekit-cli
+            elif [[ "$RUNNER_OS" == "macOS" ]]; then
+              # Homebrew no longer supports Intel macOS and builds the CLI's
+              # Go dependency tree from source. Use the supported release binary.
+              case "$(uname -m)" in
+                x86_64) cli_arch=amd64 ;;
+                arm64) cli_arch=arm64 ;;
+                *) echo "::error::Unsupported macOS CLI architecture"; exit 1 ;;
+              esac
+              install_dir="$RUNNER_TEMP/livekit-cli"
+              mkdir -p "$install_dir"
+              tag="$(gh api repos/livekit/livekit-cli/releases/latest --jq '.tag_name')"
+              gh release download "$tag" \
+                --repo livekit/livekit-cli \
+                --pattern "*_darwin_${cli_arch}.tar.gz" \
+                --output "$RUNNER_TEMP/lk.tar.gz"
+              tar -xzf "$RUNNER_TEMP/lk.tar.gz" -C "$install_dir"
+              chmod +x "$install_dir/lk"
+              echo "$install_dir" >> "$GITHUB_PATH"
+              export PATH="$install_dir:$PATH"
           elif [[ "$RUNNER_OS" == "Windows" ]]; then
             install_dir="$RUNNER_TEMP/livekit-cli"
             mkdir -p "$install_dir"

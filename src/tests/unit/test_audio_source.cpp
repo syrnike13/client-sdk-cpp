@@ -18,6 +18,8 @@
 #include <livekit/audio_source.h>
 #include <livekit/livekit.h>
 
+#include <system_error>
+
 namespace livekit::test {
 
 class AudioSourceTest : public ::testing::Test {
@@ -38,6 +40,27 @@ TEST_F(AudioSourceTest, ClearQueueIsSafeOnFreshSource) {
   AudioSource source(48000, 2, /*queue_size_ms=*/0);
   source.clearQueue();
   EXPECT_DOUBLE_EQ(source.queuedDuration(), 0.0);
+}
+
+TEST_F(AudioSourceTest, RejectsNegativeTimeoutBeforeAdmission) {
+  AudioSource source(48000, 1);
+  auto frame = AudioFrame::create(48000, 1, 480);
+  EXPECT_THROW(source.captureFrame(frame, -1), std::invalid_argument);
+  EXPECT_DOUBLE_EQ(source.queuedDuration(), 0.0);
+}
+
+TEST_F(AudioSourceTest, BufferedIngressTimeoutIsNotReportedAsSuccess) {
+  AudioSource source(48000, 1, 10);
+  auto frame = AudioFrame::create(48000, 1, 48000);
+  // One second of PCM cannot drain through a 10 ms real-time queue within
+  // the 1 ms callback deadline. PCM has already been copied by the Rust FFI.
+  try {
+    source.captureFrame(frame, 1);
+    ADD_FAILURE() << "Timed-out capture returned success";
+  } catch (const std::system_error& error) {
+    EXPECT_EQ(error.code(), std::make_error_code(std::errc::timed_out));
+  }
+  source.clearQueue();
 }
 
 } // namespace livekit::test

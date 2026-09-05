@@ -18,6 +18,8 @@
 #include <livekit/livekit.h>
 #include <livekit/video_source.h>
 
+#include <array>
+
 namespace livekit::test {
 
 class VideoSourceTest : public ::testing::Test {
@@ -38,6 +40,19 @@ TEST_F(VideoSourceTest, VideoCaptureOptionsDefaults) {
   EXPECT_EQ(options.timestamp_us, 0);
   EXPECT_EQ(options.rotation, VideoRotation::VIDEO_ROTATION_0);
   EXPECT_FALSE(options.metadata.has_value());
+}
+
+TEST_F(VideoSourceTest, PreEncodedSourceHasStrictEncodedInterface) {
+  EncodedVideoSource source(640, 480);
+  EXPECT_EQ(source.width(), 640);
+  EXPECT_EQ(source.height(), 480);
+  EXPECT_NE(source.ffiHandleId(), 0u);
+  EXPECT_FALSE(source.takeKeyFrameRequest());
+
+  constexpr std::array<std::uint8_t, 5> access_unit{0, 0, 0, 1, 0x65};
+  const EncodedVideoFrame frame{access_unit.data(), access_unit.size(), 1'000,
+                                true, {}};
+  EXPECT_FALSE(source.captureFrame(frame));
 }
 
 } // namespace livekit::test

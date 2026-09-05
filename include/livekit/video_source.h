@@ -16,6 +16,8 @@
 
 #pragma once
 
+// Downstream builds use this feature-test macro in #if/#ifdef expressions.
+// NOLINTNEXTLINE(modernize-macro-to-enum)
 #define LIVEKIT_CPP_HAS_PREENCODED_VIDEO_SOURCE 1
 
 #include <cstddef>

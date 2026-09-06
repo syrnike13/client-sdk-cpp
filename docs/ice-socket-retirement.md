@@ -168,4 +168,3 @@ int main(int argc, char** argv) {
   return gathered ? 0 : 4;
 }
 ```
-

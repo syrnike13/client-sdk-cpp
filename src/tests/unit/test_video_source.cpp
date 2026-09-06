@@ -19,6 +19,7 @@
 #include <livekit/video_source.h>
 
 #include <array>
+#include <chrono>
 #include <stdexcept>
 
 namespace livekit::test {
@@ -49,12 +50,21 @@ TEST_F(VideoSourceTest, PreEncodedSourceHasStrictEncodedInterface) {
   EXPECT_EQ(source.height(), 480);
   EXPECT_NE(source.ffiHandleId(), 0u);
   EXPECT_FALSE(source.takeKeyFrameRequest());
+  EXPECT_FALSE(source.takeBitrateRequest().has_value());
 
   constexpr std::array<std::uint8_t, 5> access_unit{0, 0, 0, 1, 0x65};
   const EncodedVideoFrame frame{access_unit.data(), access_unit.size(), 1'000, true, {}};
   // Acceptance transfers bytes to the source; it does not validate the H.264
   // bitstream or imply that a subscriber has decoded it.
   EXPECT_TRUE(source.captureFrame(frame));
+  // Without a sender there is no allocation. Polling consumes no frame state.
+  const auto polling_start = std::chrono::steady_clock::now();
+  for (int poll = 0; poll < 1000; ++poll) {
+    EXPECT_FALSE(source.takeBitrateRequest().has_value());
+  }
+  RecordProperty("bitrate_poll_1000_us", std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                            std::chrono::steady_clock::now() - polling_start)
+                                                            .count()));
   EXPECT_THROW(source.captureFrame(EncodedVideoFrame{}), std::invalid_argument);
   const EncodedVideoFrame empty_frame{access_unit.data(), 0, 1'000, true, {}};
   EXPECT_THROW(source.captureFrame(empty_frame), std::invalid_argument);

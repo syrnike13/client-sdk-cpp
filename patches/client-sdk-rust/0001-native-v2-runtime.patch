@@ -1,3 +1,18 @@
+diff --git a/.changeset/preencoded-bitrate-feedback.md b/.changeset/preencoded-bitrate-feedback.md
+new file mode 100644
+index 00000000..0dffd207
+--- /dev/null
++++ b/.changeset/preencoded-bitrate-feedback.md
+@@ -0,0 +1,9 @@
++---
++livekit-ffi: patch
++webrtc-sys: patch
++---
++
++Expose the current pre-encoded sender bitrate allocation through a coalesced
++FFI read and retain WebRTC frame backpressure for external encoders. The bitrate
++request does not change source dimensions or target FPS, and is distinct from a
++fresh network-capacity estimate. Reference continuity remains fenced after drops.
 diff --git a/.changeset/preencoded-reference-continuity.md b/.changeset/preencoded-reference-continuity.md
 new file mode 100644
 index 00000000..d267a689
@@ -99,19 +114,20 @@ index 00a7a919..b033b780 100644
          self.handle.sender()
      }
 diff --git a/livekit-ffi/protocol/ffi.proto b/livekit-ffi/protocol/ffi.proto
-index 53ea782b..74276479 100644
+index 53ea782b..d5615aa4 100644
 --- a/livekit-ffi/protocol/ffi.proto
 +++ b/livekit-ffi/protocol/ffi.proto
-@@ -89,6 +89,8 @@ message FfiRequest {
+@@ -89,6 +89,9 @@ message FfiRequest {
      CaptureVideoFrameRequest capture_video_frame = 22;
      VideoConvertRequest video_convert = 23;
      VideoStreamFromParticipantRequest video_stream_from_participant = 24;
 +    CaptureEncodedVideoFrameRequest capture_encoded_video_frame = 87;
 +    TakeVideoKeyFrameRequestRequest take_video_key_frame_request = 88;
++    TakeVideoBitrateRequestRequest take_video_bitrate_request = 89;
  
      // Audio
      NewAudioStreamRequest new_audio_stream = 25;
-@@ -184,7 +186,7 @@ message FfiRequest {
+@@ -184,7 +187,7 @@ message FfiRequest {
      // Room event ready signal
      ReadyForRoomEventRequest ready_for_room_event = 83;
  
@@ -120,16 +136,17 @@ index 53ea782b..74276479 100644
    }
  }
  
-@@ -221,6 +223,8 @@ message FfiResponse {
+@@ -221,6 +224,9 @@ message FfiResponse {
      CaptureVideoFrameResponse capture_video_frame = 22;
      VideoConvertResponse video_convert = 23;
      VideoStreamFromParticipantResponse video_stream_from_participant = 24;
 +    CaptureEncodedVideoFrameResponse capture_encoded_video_frame = 87;
 +    TakeVideoKeyFrameRequestResponse take_video_key_frame_request = 88;
++    TakeVideoBitrateRequestResponse take_video_bitrate_request = 89;
  
      // Audio
      NewAudioStreamResponse new_audio_stream = 25;
-@@ -313,7 +317,7 @@ message FfiResponse {
+@@ -313,7 +319,7 @@ message FfiResponse {
      // Room event ready signal
      ReadyForRoomEventResponse ready_for_room_event = 82;
  
@@ -151,10 +168,10 @@ index df08ed5b..ab1068a5 100644
  
  // Controls how the encoder degrades quality when bandwidth is constrained.
 diff --git a/livekit-ffi/protocol/video_frame.proto b/livekit-ffi/protocol/video_frame.proto
-index a4b610e0..eadb22ca 100644
+index a4b610e0..82b60f0c 100644
 --- a/livekit-ffi/protocol/video_frame.proto
 +++ b/livekit-ffi/protocol/video_frame.proto
-@@ -82,6 +82,22 @@ message CaptureVideoFrameRequest {
+@@ -82,6 +82,27 @@ message CaptureVideoFrameRequest {
  
  message CaptureVideoFrameResponse {}
  
@@ -174,10 +191,15 @@ index a4b610e0..eadb22ca 100644
 +message TakeVideoKeyFrameRequestRequest { required uint64 source_handle = 1; }
 +message TakeVideoKeyFrameRequestResponse { required bool requested = 1; }
 +
++// Current sender allocation, coalesced until read. This is a bitrate command,
++// not an estimate of available network capacity or a request to change FPS.
++message TakeVideoBitrateRequestRequest { required uint64 source_handle = 1; }
++message TakeVideoBitrateRequestResponse { optional uint64 target_bitrate_bps = 1; }
++
  message VideoConvertRequest {
    optional bool flip_y = 1;
    required VideoBufferInfo buffer = 2;
-@@ -207,6 +223,7 @@ message VideoSourceResolution {
+@@ -207,6 +228,7 @@ message VideoSourceResolution {
  
  enum VideoSourceType {
    VIDEO_SOURCE_NATIVE = 0;
@@ -208,10 +230,10 @@ index 4922add5..281dcfc7 100644
  
          for (proto_backend, expected) in cases {
 diff --git a/livekit-ffi/src/server/requests.rs b/livekit-ffi/src/server/requests.rs
-index 8ee56988..80b299b7 100644
+index 8ee56988..95f1c87c 100644
 --- a/livekit-ffi/src/server/requests.rs
 +++ b/livekit-ffi/src/server/requests.rs
-@@ -520,6 +520,27 @@ unsafe fn on_capture_video_frame(
+@@ -520,6 +520,37 @@ unsafe fn on_capture_video_frame(
      Ok(proto::CaptureVideoFrameResponse::default())
  }
  
@@ -236,10 +258,20 @@ index 8ee56988..80b299b7 100644
 +    Ok(proto::TakeVideoKeyFrameRequestResponse { requested: source.take_key_frame_request()? })
 +}
 +
++fn on_take_video_bitrate_request(
++    server: &'static FfiServer,
++    request: proto::TakeVideoBitrateRequestRequest,
++) -> FfiResult<proto::TakeVideoBitrateRequestResponse> {
++    let source = server.retrieve_handle::<video_source::FfiVideoSource>(request.source_handle)?;
++    Ok(proto::TakeVideoBitrateRequestResponse {
++        target_bitrate_bps: source.take_bitrate_request()?,
++    })
++}
++
  /// Convert a video frame
  ///
  /// # Safety: The user must ensure that the pointers/len provided are valid
-@@ -1390,6 +1411,12 @@ pub fn handle_request(
+@@ -1390,6 +1421,13 @@ pub fn handle_request(
          }
          Request::NewVideoSource(req) => on_new_video_source(server, req)?.into(),
          Request::CaptureVideoFrame(req) => unsafe { on_capture_video_frame(server, req)?.into() },
@@ -249,11 +281,12 @@ index 8ee56988..80b299b7 100644
 +        Request::TakeVideoKeyFrameRequest(req) => {
 +            on_take_video_key_frame_request(server, req)?.into()
 +        }
++        Request::TakeVideoBitrateRequest(req) => on_take_video_bitrate_request(server, req)?.into(),
          Request::VideoConvert(req) => unsafe { on_video_convert(server, req)?.into() },
          Request::NewAudioStream(req) => on_new_audio_stream(server, req)?.into(),
          Request::NewAudioSource(req) => on_new_audio_source(server, req)?.into(),
 diff --git a/livekit-ffi/src/server/video_source.rs b/livekit-ffi/src/server/video_source.rs
-index ee1410a7..ab0284f6 100644
+index ee1410a7..1b280e2d 100644
 --- a/livekit-ffi/src/server/video_source.rs
 +++ b/livekit-ffi/src/server/video_source.rs
 @@ -16,9 +16,13 @@ use super::{colorcvt, FfiHandle};
@@ -285,7 +318,7 @@ index ee1410a7..ab0284f6 100644
              _ => return Err(FfiError::InvalidRequest("unsupported video source type".into())),
          };
  
-@@ -94,6 +105,57 @@ impl FfiVideoSource {
+@@ -94,6 +105,71 @@ impl FfiVideoSource {
          }
          Ok(())
      }
@@ -337,6 +370,20 @@ index ee1410a7..ab0284f6 100644
 +        match self.source {
 +            #[cfg(not(target_arch = "wasm32"))]
 +            RtcVideoSource::Native(ref source) => Ok(source.take_keyframe_request()),
++            _ => Err(FfiError::InvalidRequest("unsupported video source type".into())),
++        }
++    }
++
++    /// Consume the latest pre-encoded sender bitrate allocation, if changed.
++    pub(crate) fn take_bitrate_request(&self) -> FfiResult<Option<u64>> {
++        if self.source_type != proto::VideoSourceType::VideoSourceNativeEncoded {
++            return Err(FfiError::InvalidRequest("video source is not pre-encoded".into()));
++        }
++        match self.source {
++            #[cfg(not(target_arch = "wasm32"))]
++            RtcVideoSource::Native(ref source) => {
++                Ok(source.take_rate_control_request().map(|value| value.target_bitrate_bps))
++            }
 +            _ => Err(FfiError::InvalidRequest("unsupported video source type".into())),
 +        }
 +    }
@@ -1383,7 +1430,7 @@ index 21337794..042ee055 100644
  static std::shared_ptr<MediaStreamTrack> video_to_media(
      std::shared_ptr<VideoTrack> track) {
 diff --git a/webrtc-sys/src/passthrough_video_encoder.cpp b/webrtc-sys/src/passthrough_video_encoder.cpp
-index cd45b9e3..15fab01e 100644
+index cd45b9e3..1981a4e9 100644
 --- a/webrtc-sys/src/passthrough_video_encoder.cpp
 +++ b/webrtc-sys/src/passthrough_video_encoder.cpp
 @@ -26,12 +26,13 @@
@@ -1481,15 +1528,18 @@ index cd45b9e3..15fab01e 100644
        RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder callback failed "
                          << result.error;
        return WEBRTC_VIDEO_CODEC_ERROR;
-@@ -331,6 +350,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+@@ -331,6 +350,10 @@ class PassthroughVideoEncoder final : public VideoEncoder {
      info.supports_native_handle = true;
      info.implementation_name = "LiveKit pre-encoded passthrough";
      info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
-+    info.has_trusted_rate_controller = true;
++    // External encoders may reach their bitrate floor above available
++    // bandwidth. Keep WebRTC backpressure; the continuity guard requests IDR
++    // after a drop.
++    info.has_trusted_rate_controller = false;
      info.is_hardware_accelerated = false;
      info.supports_simulcast = false;
      info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNative};
-@@ -338,8 +358,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+@@ -338,8 +361,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
    }
  
   private:
@@ -1499,7 +1549,7 @@ index cd45b9e3..15fab01e 100644
      std::optional<livekit::EncodedRateControlRequest> request;
      {
        webrtc::MutexLock lock(&rate_control_mutex_);
-@@ -357,10 +376,13 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+@@ -357,10 +379,13 @@ class PassthroughVideoEncoder final : public VideoEncoder {
    VideoCodecType codec_type_;
    VideoCodec codec_;
    EncodedImageCallback* encoded_image_callback_ = nullptr;
@@ -1514,7 +1564,7 @@ index cd45b9e3..15fab01e 100644
  };
  
  }  // namespace
-@@ -388,8 +410,8 @@ PassthroughVideoEncoderFactory::GetSupportedFormats() const {
+@@ -388,8 +413,8 @@ PassthroughVideoEncoderFactory::GetSupportedFormats() const {
    return supported_formats_;
  }
  

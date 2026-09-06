@@ -105,4 +105,17 @@ bool EncodedVideoSource::takeKeyFrameRequest() {
   return resp.take_video_key_frame_request().requested();
 }
 
+std::optional<std::uint64_t> EncodedVideoSource::takeBitrateRequest() {
+  if (ffiHandleId() == 0) return std::nullopt;
+  proto::FfiRequest req;
+  req.mutable_take_video_bitrate_request()->set_source_handle(ffiHandleId());
+  const proto::FfiResponse resp = FfiClient::instance().sendRequest(req);
+  if (!resp.has_take_video_bitrate_request()) {
+    throw std::runtime_error("FfiResponse missing take_video_bitrate_request");
+  }
+  const auto& allocation = resp.take_video_bitrate_request();
+  if (!allocation.has_target_bitrate_bps()) return std::nullopt;
+  return allocation.target_bitrate_bps();
+}
+
 } // namespace livekit

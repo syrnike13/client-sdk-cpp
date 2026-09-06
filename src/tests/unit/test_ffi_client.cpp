@@ -359,20 +359,32 @@ TEST_F(FfiClientTest, ShutdownFromListenerDoesNotDeadlock) {
 TEST_F(FfiClientTest, ShutdownRejectsReinitializeAndDropsNewEventsWhileDraining) {
   ASSERT_TRUE(FfiClient::instance().initialize(false));
 
+  proto::FfiEvent test_event;
+  auto* test_record = test_event.mutable_logs()->add_records();
+  test_record->set_level(proto::LOG_INFO);
+  test_record->set_target("shutdown-drain-probe");
+  test_record->set_message("listener event");
+
   std::promise<void> callback_entered;
   auto callback_entered_future = callback_entered.get_future();
   std::promise<void> release_callback;
   auto release_callback_future = release_callback.get_future();
   std::atomic<int> listener_calls{0};
 
-  const auto id = FfiClient::instance().addListener([&](const proto::FfiEvent&) {
+  const auto id = FfiClient::instance().addListener([&](const proto::FfiEvent& event) {
+    // Real asynchronous SDK events can still arrive before shutdown starts.
+    // Only the explicit test event may open this test's callback gate.
+    if (!event.has_logs() || event.logs().records_size() != 1 ||
+        event.logs().records(0).target() != "shutdown-drain-probe") {
+      return;
+    }
     ++listener_calls;
     callback_entered.set_value();
     release_callback_future.wait();
   });
   ASSERT_NE(id, 0);
 
-  std::thread callback_thread([] { emitEvent(); });
+  std::thread callback_thread([&] { emitFfiEvent(test_event); });
   ASSERT_EQ(callback_entered_future.wait_for(kListenerSyncTimeout), std::future_status::ready);
 
   auto shutdown_future = std::async(std::launch::async, [] { FfiClient::instance().shutdown(); });
@@ -383,7 +395,7 @@ TEST_F(FfiClientTest, ShutdownRejectsReinitializeAndDropsNewEventsWhileDraining)
   EXPECT_EQ(shutdown_future.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
   EXPECT_FALSE(FfiClient::instance().initialize(false));
 
-  emitEvent();
+  emitFfiEvent(test_event);
   EXPECT_EQ(listener_calls.load(), 1);
 
   release_callback.set_value();

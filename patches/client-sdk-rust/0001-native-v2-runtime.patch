@@ -1111,6 +1111,57 @@ index 40e5fece..f0e7c560 100644
    webrtc::scoped_refptr<webrtc::EncodedImageBuffer> payload_;
    std::shared_ptr<std::atomic<bool>> keyframe_request_flag_;
    std::shared_ptr<EncodedRateControlState> rate_control_state_;
+diff --git a/webrtc-sys/include/livekit/peer_connection.h b/webrtc-sys/include/livekit/peer_connection.h
+index 50c545c7..f9df1357 100644
+--- a/webrtc-sys/include/livekit/peer_connection.h
++++ b/webrtc-sys/include/livekit/peer_connection.h
+@@ -53,7 +53,8 @@ class PeerConnection : webrtc::PeerConnectionObserver {
+ 
+   ~PeerConnection();
+ 
+-  bool Initialize(webrtc::PeerConnectionInterface::RTCConfiguration config);
++  bool Initialize(webrtc::PeerConnectionInterface::RTCConfiguration config,
++                  std::unique_ptr<webrtc::PortAllocator> allocator);
+ 
+   void set_configuration(RtcConfiguration config) const;
+ 
+@@ -146,8 +147,8 @@ class PeerConnection : webrtc::PeerConnectionObserver {
+   void OnRemoveStream(
+       webrtc::scoped_refptr<webrtc::MediaStreamInterface> stream) override;
+ 
+-  void OnDataChannel(
+-      webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override;
++  void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface>
++                         data_channel) override;
+ 
+   void OnRenegotiationNeeded() override;
+ 
+@@ -185,8 +186,8 @@ class PeerConnection : webrtc::PeerConnectionObserver {
+       const std::vector<webrtc::scoped_refptr<webrtc::MediaStreamInterface>>&
+           streams) override;
+ 
+-  void OnTrack(
+-      webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override;
++  void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface>
++                   transceiver) override;
+ 
+   void OnRemoveTrack(
+       webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver) override;
+diff --git a/webrtc-sys/include/livekit/peer_connection_factory.h b/webrtc-sys/include/livekit/peer_connection_factory.h
+index abf4f5ab..d49ab199 100644
+--- a/webrtc-sys/include/livekit/peer_connection_factory.h
++++ b/webrtc-sys/include/livekit/peer_connection_factory.h
+@@ -80,6 +80,10 @@ class PeerConnectionFactory {
+   std::shared_ptr<AudioDeviceController> audio_device_;
+   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> peer_factory_;
+   webrtc::Environment env_;
++  // Owned by peer_factory_'s connection context. PeerConnection retains that
++  // factory until its injected allocator has been destroyed.
++  webrtc::NetworkManager* network_manager_ = nullptr;
++  webrtc::PacketSocketFactory* packet_socket_factory_ = nullptr;
+ };
+ 
+ std::shared_ptr<PeerConnectionFactory> create_peer_connection_factory();
 diff --git a/webrtc-sys/include/livekit/video_track.h b/webrtc-sys/include/livekit/video_track.h
 index 21337794..042ee055 100644
 --- a/webrtc-sys/include/livekit/video_track.h
@@ -1297,6 +1348,268 @@ index cd45b9e3..15fab01e 100644
 +std::vector<SdpVideoFormat> PassthroughVideoEncoderFactory::GetImplementations()
 +    const {
    return supported_formats_;
+ }
+ 
+diff --git a/webrtc-sys/src/peer_connection.cpp b/webrtc-sys/src/peer_connection.cpp
+index 6b6f6028..c8fe0fb2 100644
+--- a/webrtc-sys/src/peer_connection.cpp
++++ b/webrtc-sys/src/peer_connection.cpp
+@@ -15,7 +15,6 @@
+  */
+ 
+ #include "livekit/peer_connection.h"
+-#include "livekit/peer_connection_factory.h"
+ 
+ #include <memory>
+ 
+@@ -26,6 +25,7 @@
+ #include "livekit/data_channel.h"
+ #include "livekit/jsep.h"
+ #include "livekit/media_stream.h"
++#include "livekit/peer_connection_factory.h"
+ #include "livekit/rtc_error.h"
+ #include "livekit/rtp_transceiver.h"
+ #include "rtc_base/logging.h"
+@@ -87,8 +87,10 @@ PeerConnection::~PeerConnection() {
+ }
+ 
+ bool PeerConnection::Initialize(
+-    webrtc::PeerConnectionInterface::RTCConfiguration config) {
++    webrtc::PeerConnectionInterface::RTCConfiguration config,
++    std::unique_ptr<webrtc::PortAllocator> allocator) {
+   webrtc::PeerConnectionDependencies deps{this};
++  deps.allocator = std::move(allocator);
+   auto result =
+       pc_factory_->CreatePeerConnectionOrError(config, std::move(deps));
+ 
+@@ -117,8 +119,8 @@ void PeerConnection::create_offer(
+         on_success,
+     rust::Fn<void(rust::Box<PeerContext>, RtcError)> on_error) const {
+   webrtc::scoped_refptr<NativeCreateSdpObserver> observer =
+-      webrtc::make_ref_counted<NativeCreateSdpObserver>(std::move(ctx), on_success,
+-                                                     on_error);
++      webrtc::make_ref_counted<NativeCreateSdpObserver>(std::move(ctx),
++                                                        on_success, on_error);
+ 
+   peer_connection_->CreateOffer(observer.get(),
+                                 to_native_offer_answer_options(options));
+@@ -131,8 +133,8 @@ void PeerConnection::create_answer(
+         on_success,
+     rust::Fn<void(rust::Box<PeerContext>, RtcError)> on_error) const {
+   webrtc::scoped_refptr<NativeCreateSdpObserver> observer =
+-      webrtc::make_ref_counted<NativeCreateSdpObserver>(std::move(ctx), on_success,
+-                                                     on_error);
++      webrtc::make_ref_counted<NativeCreateSdpObserver>(std::move(ctx),
++                                                        on_success, on_error);
+ 
+   peer_connection_->CreateAnswer(observer.get(),
+                                  to_native_offer_answer_options(options));
+@@ -144,7 +146,7 @@ void PeerConnection::set_local_description(
+     rust::Fn<void(rust::Box<PeerContext>, RtcError)> on_complete) const {
+   webrtc::scoped_refptr<NativeSetLocalSdpObserver> observer =
+       webrtc::make_ref_counted<NativeSetLocalSdpObserver>(std::move(ctx),
+-                                                       on_complete);
++                                                          on_complete);
+ 
+   peer_connection_->SetLocalDescription(desc->clone()->release(), observer);
+ }
+@@ -155,7 +157,7 @@ void PeerConnection::set_remote_description(
+     rust::Fn<void(rust::Box<PeerContext>, RtcError)> on_complete) const {
+   webrtc::scoped_refptr<NativeSetRemoteSdpObserver> observer =
+       webrtc::make_ref_counted<NativeSetRemoteSdpObserver>(std::move(ctx),
+-                                                        on_complete);
++                                                           on_complete);
+ 
+   peer_connection_->SetRemoteDescription(desc->clone()->release(), observer);
+ }
+@@ -210,8 +212,9 @@ void PeerConnection::remove_track(std::shared_ptr<RtpSender> sender) const {
+ void PeerConnection::get_stats(
+     rust::Box<PeerContext> ctx,
+     rust::Fn<void(rust::Box<PeerContext>, rust::String)> on_stats) const {
+-  auto observer = webrtc::make_ref_counted<NativeRtcStatsCollector<PeerContext>>(
+-      std::move(ctx), on_stats);
++  auto observer =
++      webrtc::make_ref_counted<NativeRtcStatsCollector<PeerContext>>(
++          std::move(ctx), on_stats);
+   peer_connection_->GetStats(observer.get());
+ }
+ 
+@@ -398,8 +401,7 @@ void PeerConnection::OnIceGatheringChange(
+   observer_->on_ice_gathering_change(static_cast<IceGatheringState>(new_state));
+ }
+ 
+-void PeerConnection::OnIceCandidate(
+-    const webrtc::IceCandidate* candidate) {
++void PeerConnection::OnIceCandidate(const webrtc::IceCandidate* candidate) {
+   auto new_candidate = webrtc::CreateIceCandidate(candidate->sdp_mid(),
+                                                   candidate->sdp_mline_index(),
+                                                   candidate->candidate());
+@@ -415,10 +417,12 @@ void PeerConnection::OnIceCandidateError(const std::string& address,
+   observer_->on_ice_candidate_error(address, port, url, error_code, error_text);
+ }
+ 
+-void PeerConnection::OnIceCandidateRemoved(const webrtc::IceCandidate* ice_candidate) {
++void PeerConnection::OnIceCandidateRemoved(
++    const webrtc::IceCandidate* ice_candidate) {
+   rust::Vec<CandidatePtr> vec;
+-  if(ice_candidate != nullptr) {
+-    vec.push_back(CandidatePtr{std::make_unique<Candidate>(ice_candidate->candidate())});
++  if (ice_candidate != nullptr) {
++    vec.push_back(
++        CandidatePtr{std::make_unique<Candidate>(ice_candidate->candidate())});
+   }
+   observer_->on_ice_candidates_removed(std::move(vec));
+ }
+diff --git a/webrtc-sys/src/peer_connection_factory.cpp b/webrtc-sys/src/peer_connection_factory.cpp
+index fe76067f..02463b1c 100644
+--- a/webrtc-sys/src/peer_connection_factory.cpp
++++ b/webrtc-sys/src/peer_connection_factory.cpp
+@@ -19,21 +19,21 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "api/audio/audio_device.h"
++#include "api/audio/builtin_audio_processing_builder.h"
+ #include "api/audio_codecs/builtin_audio_decoder_factory.h"
+ #include "api/audio_codecs/builtin_audio_encoder_factory.h"
+-#include "api/audio/builtin_audio_processing_builder.h"
++#include "api/audio_options.h"
+ #include "api/create_modular_peer_connection_factory.h"
++#include "api/enable_media.h"
+ #include "api/environment/environment_factory.h"
+ #include "api/field_trials_view.h"
+ #include "api/peer_connection_interface.h"
+ #include "api/rtc_error.h"
+-#include "api/enable_media.h"
+ #include "api/rtc_event_log/rtc_event_log_factory.h"
+ #include "api/task_queue/default_task_queue_factory.h"
+ #include "api/video_codecs/builtin_video_decoder_factory.h"
+ #include "api/video_codecs/builtin_video_encoder_factory.h"
+-#include "api/audio/audio_device.h"
+-#include "api/audio_options.h"
+ #include "livekit/adm_proxy.h"
+ #include "livekit/audio_track.h"
+ #include "livekit/peer_connection.h"
+@@ -42,6 +42,9 @@
+ #include "livekit/video_decoder_factory.h"
+ #include "livekit/video_encoder_factory.h"
+ #include "livekit/webrtc.h"
++#include "p2p/base/basic_packet_socket_factory.h"
++#include "p2p/client/basic_port_allocator.h"
++#include "rtc_base/network.h"
+ #include "rtc_base/thread.h"
+ #include "webrtc-sys/src/peer_connection.rs.h"
+ #include "webrtc-sys/src/peer_connection_factory.rs.h"
+@@ -49,6 +52,27 @@
+ namespace livekit_ffi {
+ namespace {
+ 
++class PortOwnedSocketAllocator final : public webrtc::BasicPortAllocator {
++ public:
++  using webrtc::BasicPortAllocator::BasicPortAllocator;
++
++  webrtc::PortAllocatorSession* CreateSessionInternal(
++      absl::string_view content_name,
++      int component,
++      absl::string_view ice_ufrag,
++      absl::string_view ice_pwd) override {
++    auto* session = webrtc::BasicPortAllocator::CreateSessionInternal(
++        content_name, component, ice_ufrag, ice_pwd);
++    // A retained AllocationSequence owns its shared UDP socket even after its
++    // ports are pruned during failed-network regathering. Give each port its
++    // own socket so port destruction also closes that socket. Keep continual
++    // gathering, every network type, and all other allocation flags unchanged.
++    session->set_flags(session->flags() &
++                       ~webrtc::PORTALLOCATOR_ENABLE_SHARED_SOCKET);
++    return session;
++  }
++};
++
+ constexpr char kForcePlayoutDelayFieldTrial[] =
+     "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:0/";
+ constexpr char kForcePlayoutDelayValue[] = "min_ms:0,max_ms:0";
+@@ -83,14 +107,24 @@ PeerConnectionFactory::PeerConnectionFactory(
+ PeerConnectionFactory::PeerConnectionFactory(
+     std::shared_ptr<RtcRuntime> rtc_runtime,
+     bool zero_playout_delay)
+-    : rtc_runtime_(rtc_runtime),
+-      env_(CreateEnvironment(zero_playout_delay)) {
++    : rtc_runtime_(rtc_runtime), env_(CreateEnvironment(zero_playout_delay)) {
+   webrtc::PeerConnectionFactoryDependencies dependencies;
+   dependencies.network_thread = rtc_runtime_->network_thread();
+   dependencies.worker_thread = rtc_runtime_->worker_thread();
+   dependencies.signaling_thread = rtc_runtime_->signaling_thread();
+   dependencies.socket_factory = rtc_runtime_->network_thread()->socketserver();
+-  dependencies.event_log_factory = std::make_unique<webrtc::RtcEventLogFactory>();
++  rtc_runtime_->network_thread()->BlockingCall([&] {
++    dependencies.network_manager =
++        std::make_unique<webrtc::BasicNetworkManager>(
++            env_, rtc_runtime_->network_thread()->socketserver());
++    dependencies.packet_socket_factory =
++        std::make_unique<webrtc::BasicPacketSocketFactory>(
++            rtc_runtime_->network_thread()->socketserver());
++    network_manager_ = dependencies.network_manager.get();
++    packet_socket_factory_ = dependencies.packet_socket_factory.get();
++  });
++  dependencies.event_log_factory =
++      std::make_unique<webrtc::RtcEventLogFactory>();
+   dependencies.env = env_;
+ 
+   if (zero_playout_delay) {
+@@ -111,9 +145,12 @@ PeerConnectionFactory::PeerConnectionFactory(
+       std::move(std::make_unique<livekit_ffi::VideoEncoderFactory>());
+   dependencies.video_decoder_factory =
+       std::move(std::make_unique<livekit_ffi::VideoDecoderFactory>());
+-  dependencies.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
+-  dependencies.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
+-  dependencies.audio_processing_builder = std::make_unique<webrtc::BuiltinAudioProcessingBuilder>();
++  dependencies.audio_encoder_factory =
++      webrtc::CreateBuiltinAudioEncoderFactory();
++  dependencies.audio_decoder_factory =
++      webrtc::CreateBuiltinAudioDecoderFactory();
++  dependencies.audio_processing_builder =
++      std::make_unique<webrtc::BuiltinAudioProcessingBuilder>();
+ 
+   webrtc::EnableMedia(dependencies);
+   peer_factory_ =
+@@ -130,17 +167,26 @@ PeerConnectionFactory::~PeerConnectionFactory() {
+ 
+   peer_factory_ = nullptr;
+   audio_device_ = nullptr;
+-  rtc_runtime_->worker_thread()->BlockingCall(
+-      [this] { adm_proxy_ = nullptr; });
++  rtc_runtime_->worker_thread()->BlockingCall([this] { adm_proxy_ = nullptr; });
+ }
+ 
+ std::shared_ptr<PeerConnection> PeerConnectionFactory::create_peer_connection(
+     RtcConfiguration config,
+     rust::Box<PeerConnectionObserverWrapper> observer) const {
++  if (!peer_factory_) {
++    throw std::runtime_error(serialize_error(
++        to_error(webrtc::RTCError(webrtc::RTCErrorType::INTERNAL_ERROR,
++                                  "peer connection factory unavailable"))));
++  }
+   std::shared_ptr<PeerConnection> pc = std::make_shared<PeerConnection>(
+       rtc_runtime_, peer_factory_, std::move(observer));
+ 
+-  if (!pc->Initialize(to_native_rtc_configuration(config))) {
++  auto allocator = rtc_runtime_->network_thread()->BlockingCall([&] {
++    return std::make_unique<PortOwnedSocketAllocator>(env_, network_manager_,
++                                                      packet_socket_factory_);
++  });
++  if (!pc->Initialize(to_native_rtc_configuration(config),
++                      std::move(allocator))) {
+     throw std::runtime_error(serialize_error(to_error(webrtc::RTCError(
+         webrtc::RTCErrorType::INTERNAL_ERROR, "failed to initialize pc"))));
+   }
+@@ -197,7 +243,8 @@ RtpCapabilities PeerConnectionFactory::rtp_receiver_capabilities(
+       static_cast<webrtc::MediaType>(type)));
+ }
+ 
+-std::shared_ptr<AudioDeviceController> PeerConnectionFactory::audio_device() const {
++std::shared_ptr<AudioDeviceController> PeerConnectionFactory::audio_device()
++    const {
+   return audio_device_;
  }
  
 diff --git a/webrtc-sys/src/rtp_sender.cpp b/webrtc-sys/src/rtp_sender.cpp

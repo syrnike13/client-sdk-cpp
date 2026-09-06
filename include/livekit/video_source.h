@@ -144,6 +144,13 @@ public:
   /// @brief Return and clear a pending PLI/FIR key-frame request.
   /// @return Whether the application encoder must produce a key frame.
   bool takeKeyFrameRequest();
+
+  /// @brief Consume the newest WebRTC sender bitrate allocation.
+  /// @return Latest bitrate in bits per second, or no value when unchanged.
+  /// Zero is a valid allocation under congestion. This is sender control state,
+  /// not a fresh network-capacity measurement; it never changes the source FPS.
+  /// @throws std::runtime_error if the FFI request fails.
+  [[nodiscard]] std::optional<std::uint64_t> takeBitrateRequest();
 };
 
 } // namespace livekit

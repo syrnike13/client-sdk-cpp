@@ -135,6 +135,8 @@ public:
   EncodedVideoSource(int width, int height);
 
   /// @brief Submit one H.264 access unit synchronously.
+  /// Callers own bounded raw-input admission and bitrate control before encoding.
+  /// The SDK does not use its rate dropper on pre-encoded reference frames.
   /// @param frame Borrowed access-unit bytes and frame metadata.
   /// @return Whether LiveKit accepted the access unit for delivery.
   /// @throws std::invalid_argument if the payload is empty.

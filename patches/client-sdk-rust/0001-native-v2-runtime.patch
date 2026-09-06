@@ -13,6 +13,21 @@ index 00000000..0dffd207
 +FFI read and retain WebRTC frame backpressure for external encoders. The bitrate
 +request does not change source dimensions or target FPS, and is distinct from a
 +fresh network-capacity estimate. Reference continuity remains fenced after drops.
+diff --git a/.changeset/preencoded-raw-admission.md b/.changeset/preencoded-raw-admission.md
+new file mode 100644
+index 00000000..2aeab771
+--- /dev/null
++++ b/.changeset/preencoded-raw-admission.md
+@@ -0,0 +1,9 @@
++---
++webrtc-sys: patch
++---
++
++Keep the bitrate-based frame dropper disabled for pre-encoded video. The source
++owns bounded raw-input admission and applies sender rate feedback before
++encoding. Dropping encoded reference frames merely creates repeated keyframe
++recovery and is not a substitute for source backpressure. The existing
++continuity guard still handles unavoidable missing encoded frames.
 diff --git a/.changeset/preencoded-reference-continuity.md b/.changeset/preencoded-reference-continuity.md
 new file mode 100644
 index 00000000..d267a689
@@ -1430,7 +1445,7 @@ index 21337794..042ee055 100644
  static std::shared_ptr<MediaStreamTrack> video_to_media(
      std::shared_ptr<VideoTrack> track) {
 diff --git a/webrtc-sys/src/passthrough_video_encoder.cpp b/webrtc-sys/src/passthrough_video_encoder.cpp
-index cd45b9e3..1981a4e9 100644
+index cd45b9e3..9d50e638 100644
 --- a/webrtc-sys/src/passthrough_video_encoder.cpp
 +++ b/webrtc-sys/src/passthrough_video_encoder.cpp
 @@ -26,12 +26,13 @@
@@ -1528,18 +1543,17 @@ index cd45b9e3..1981a4e9 100644
        RTC_LOG(LS_ERROR) << "PassthroughVideoEncoder callback failed "
                          << result.error;
        return WEBRTC_VIDEO_CODEC_ERROR;
-@@ -331,6 +350,10 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+@@ -331,6 +350,9 @@ class PassthroughVideoEncoder final : public VideoEncoder {
      info.supports_native_handle = true;
      info.implementation_name = "LiveKit pre-encoded passthrough";
      info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
-+    // External encoders may reach their bitrate floor above available
-+    // bandwidth. Keep WebRTC backpressure; the continuity guard requests IDR
-+    // after a drop.
-+    info.has_trusted_rate_controller = false;
++    // Encoded reference frames cannot be dropped to meet a rate allocation.
++    // Forward rate feedback to the source; its raw admission controls pressure.
++    info.has_trusted_rate_controller = true;
      info.is_hardware_accelerated = false;
      info.supports_simulcast = false;
      info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNative};
-@@ -338,8 +361,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+@@ -338,8 +360,7 @@ class PassthroughVideoEncoder final : public VideoEncoder {
    }
  
   private:
@@ -1549,7 +1563,7 @@ index cd45b9e3..1981a4e9 100644
      std::optional<livekit::EncodedRateControlRequest> request;
      {
        webrtc::MutexLock lock(&rate_control_mutex_);
-@@ -357,10 +379,13 @@ class PassthroughVideoEncoder final : public VideoEncoder {
+@@ -357,10 +378,13 @@ class PassthroughVideoEncoder final : public VideoEncoder {
    VideoCodecType codec_type_;
    VideoCodec codec_;
    EncodedImageCallback* encoded_image_callback_ = nullptr;
@@ -1564,7 +1578,7 @@ index cd45b9e3..1981a4e9 100644
  };
  
  }  // namespace
-@@ -388,8 +413,8 @@ PassthroughVideoEncoderFactory::GetSupportedFormats() const {
+@@ -388,8 +412,8 @@ PassthroughVideoEncoderFactory::GetSupportedFormats() const {
    return supported_formats_;
  }
  

@@ -752,10 +752,26 @@ index a59aab58..7b51092e 100644
 +    dc.on_buffered_amount_change(Some(on_buffered_amount_change(rtc_emitter, kind)));
  }
 diff --git a/livekit/src/rtc_engine/rtc_session.rs b/livekit/src/rtc_engine/rtc_session.rs
-index bb6c45f3..bc9a6da1 100644
+index bb6c45f3..ff00a92e 100644
 --- a/livekit/src/rtc_engine/rtc_session.rs
 +++ b/livekit/src/rtc_engine/rtc_session.rs
-@@ -379,6 +379,8 @@ struct SessionInner {
+@@ -96,6 +96,7 @@ struct NegotiationQueue {
+     waker: Arc<Notify>,
+     task_running: AtomicBool,
+     waiting_for_answer: AtomicBool,
++    task: Mutex<Option<(oneshot::Sender<()>, JoinHandle<()>)>>,
+ }
+ 
+ impl NegotiationQueue {
+@@ -105,6 +106,7 @@ impl NegotiationQueue {
+             waker: Arc::new(Notify::new()),
+             task_running: AtomicBool::new(false),
+             waiting_for_answer: AtomicBool::new(false),
++            task: Mutex::new(None),
+         }
+     }
+ }
+@@ -379,6 +381,8 @@ struct SessionInner {
      dispatched_streams: Mutex<HashSet<(String, String)>>,
  
      pending_tracks: Mutex<HashMap<String, oneshot::Sender<proto::TrackInfo>>>,
@@ -764,7 +780,7 @@ index bb6c45f3..bc9a6da1 100644
  
      // Publisher data channels
      // used to send data to other participants (The SFU forwards the messages)
-@@ -449,6 +451,62 @@ struct SessionInner {
+@@ -449,6 +453,62 @@ struct SessionInner {
      pc_state_notify: Notify,
  }
  
@@ -827,7 +843,7 @@ index bb6c45f3..bc9a6da1 100644
  /// Information about the local participant needed for outgoing
  /// data packets.
  struct SessionParticipantInfo {
-@@ -474,6 +532,10 @@ impl SessionParticipantInfo {
+@@ -474,6 +534,10 @@ impl SessionParticipantInfo {
  pub struct RtcSession {
      inner: Arc<SessionInner>,
      handle: Mutex<Option<SessionHandle>>,
@@ -838,7 +854,7 @@ index bb6c45f3..bc9a6da1 100644
  }
  
  impl Debug for RtcSession {
-@@ -601,7 +663,11 @@ impl RtcSession {
+@@ -601,7 +665,11 @@ impl RtcSession {
              rtc_events::forward_pc_events(sub_pc, rtc_emitter.clone());
          }
          rtc_events::forward_dc_events(&mut lossy_dc, DataPacketKind::Lossy, rtc_emitter.clone());
@@ -851,7 +867,7 @@ index bb6c45f3..bc9a6da1 100644
  
          let (close_tx, close_rx) = watch::channel(false);
  
-@@ -622,6 +688,8 @@ impl RtcSession {
+@@ -622,6 +690,8 @@ impl RtcSession {
              mid_to_track_id: Mutex::new(HashMap::new()),
              dispatched_streams: Mutex::new(HashSet::new()),
              pending_tracks: Default::default(),
@@ -860,7 +876,7 @@ index bb6c45f3..bc9a6da1 100644
              lossy_dc,
              lossy_dc_buffered_amount_low_threshold: AtomicU64::new(
                  INITIAL_BUFFERED_AMOUNT_LOW_THRESHOLD,
-@@ -707,7 +775,7 @@ impl RtcSession {
+@@ -707,7 +777,7 @@ impl RtcSession {
              inner.publisher_negotiation_needed();
          }
  
@@ -869,7 +885,7 @@ index bb6c45f3..bc9a6da1 100644
      }
  
      fn create_data_channels(
-@@ -1666,7 +1734,7 @@ impl SessionInner {
+@@ -1666,7 +1736,7 @@ impl SessionInner {
                      );
                  }
              }
@@ -878,7 +894,7 @@ index bb6c45f3..bc9a6da1 100644
                  let ev = DataChannelEvent {
                      kind,
                      detail: DataChannelEventDetail::BufferedAmountChange(sent),
-@@ -1875,13 +1943,24 @@ impl SessionInner {
+@@ -1875,13 +1945,24 @@ impl SessionInner {
      }
  
      fn remove_track(&self, sender: RtpSender) -> EngineResult<()> {
@@ -905,7 +921,7 @@ index bb6c45f3..bc9a6da1 100644
          Ok(())
      }
  
-@@ -1904,17 +1983,37 @@ impl SessionInner {
+@@ -1904,17 +1985,37 @@ impl SessionInner {
                  let sum: u64 = encodings.iter().filter_map(|e| e.max_bitrate).sum();
                  (sum > 0).then_some(sum)
              };
@@ -951,7 +967,7 @@ index bb6c45f3..bc9a6da1 100644
  
          if track.kind() == TrackKind::Video {
              transceiver.sender().set_video_encoder_backend(options.video_encoder);
-@@ -1952,9 +2051,29 @@ impl SessionInner {
+@@ -1952,9 +2053,29 @@ impl SessionInner {
              transceiver.set_codec_preferences(matched)?;
          }
  
@@ -981,7 +997,72 @@ index bb6c45f3..bc9a6da1 100644
      /// Called when the SignalClient or one of the PeerConnection has lost the connection
      /// The RTCEngine may try a reconnect.
      fn on_session_disconnected(
-@@ -2573,7 +2692,9 @@ make_rtc_config!(make_rtc_config_reconnect, proto::ReconnectResponse);
+@@ -1981,6 +2102,22 @@ impl SessionInner {
+         self.closed.store(true, Ordering::Release);
+         self.pc_state_notify.notify_waiters();
+ 
++        // Negotiation tasks also own the session. Cancel and join them before
++        // closing signaling/PeerConnections, including the answer timeout.
++        let negotiation_task = {
++            let mut state = self.negotiation_queue.state.lock();
++            *state = NegotiationState::Idle;
++            self.negotiation_queue.task.lock().take()
++        };
++        if let Some((cancel, task)) = negotiation_task {
++            let _ = cancel.send(());
++            let _ = task.await;
++        }
++        let debouncer = self.negotiation_debouncer.lock().take();
++        if let Some(debouncer) = debouncer {
++            debouncer.cancel().await;
++        }
++
+         self.signal_client
+             .send(proto::signal_request::Message::Leave(proto::LeaveRequest {
+                 action: proto::leave_request::Action::Disconnect.into(),
+@@ -2298,6 +2435,9 @@ impl SessionInner {
+ 
+     fn queue_negotiation(self: &Arc<Self>) {
+         let mut state = self.negotiation_queue.state.lock();
++        if self.closed.load(Ordering::Acquire) {
++            return;
++        }
+ 
+         match *state {
+             NegotiationState::Idle => {
+@@ -2309,13 +2449,17 @@ impl SessionInner {
+ 
+                 log::debug!("queue_negotiation: starting new negotiation");
+                 *state = NegotiationState::InProgress;
+-                drop(state);
+-
+                 let session = self.clone();
+-                livekit_runtime::spawn(async move {
+-                    session.execute_negotiation_with_retry().await;
++                let (cancel_tx, cancel_rx) = oneshot::channel();
++                let task = livekit_runtime::spawn(async move {
++                    tokio::select! {
++                        _ = cancel_rx => {},
++                        _ = session.execute_negotiation_with_retry() => {},
++                    }
++                    session.negotiation_queue.waiting_for_answer.store(false, Ordering::Release);
+                     session.negotiation_queue.task_running.store(false, Ordering::Release);
+                 });
++                *self.negotiation_queue.task.lock() = Some((cancel_tx, task));
+             }
+             NegotiationState::InProgress => {
+                 log::debug!("queue_negotiation: marking for retry");
+@@ -2373,6 +2517,9 @@ impl SessionInner {
+ 
+     fn debounce_negotiation(self: &Arc<Self>) {
+         let mut debouncer = self.negotiation_debouncer.lock();
++        if self.closed.load(Ordering::Acquire) {
++            return;
++        }
+ 
+         // call() returns an error if the debouncer has finished
+         if debouncer.is_none() || debouncer.as_ref().unwrap().call().is_err() {
+@@ -2573,7 +2720,9 @@ make_rtc_config!(make_rtc_config_reconnect, proto::ReconnectResponse);
  
  #[cfg(test)]
  mod tests {
@@ -992,7 +1073,7 @@ index bb6c45f3..bc9a6da1 100644
  
      #[test]
      fn parses_max_message_size_from_application_section() {
-@@ -2613,4 +2734,36 @@ mod tests {
+@@ -2613,4 +2762,36 @@ mod tests {
          assert_eq!(parse_sdp_max_message_size("a=max-message-size:abc\r\n"), None);
          assert_eq!(parse_sdp_max_message_size("a=max-message-size:\r\n"), None);
      }
@@ -1028,6 +1109,100 @@ index bb6c45f3..bc9a6da1 100644
 +        assert_ne!(video, reversed);
 +        assert_ne!(video, different_rids);
 +    }
+ }
+diff --git a/livekit/src/utils/debouncer.rs b/livekit/src/utils/debouncer.rs
+index 09bf854a..b63a55e5 100644
+--- a/livekit/src/utils/debouncer.rs
++++ b/livekit/src/utils/debouncer.rs
+@@ -27,6 +27,7 @@ pub enum DebounceError {
+ pub struct Debouncer {
+     cancel_tx: Option<oneshot::Sender<()>>,
+     tx: mpsc::UnboundedSender<()>,
++    task: Option<livekit_runtime::JoinHandle<()>>,
+ }
+ 
+ pub fn debounce<F>(duration: Duration, future: F) -> Debouncer
+@@ -35,8 +36,8 @@ where
+ {
+     let (tx, rx) = mpsc::unbounded_channel();
+     let (cancel_tx, cancel_rx) = oneshot::channel();
+-    livekit_runtime::spawn(debounce_task(duration, future, rx, cancel_rx));
+-    Debouncer { tx, cancel_tx: Some(cancel_tx) }
++    let task = livekit_runtime::spawn(debounce_task(duration, future, rx, cancel_rx));
++    Debouncer { tx, cancel_tx: Some(cancel_tx), task: Some(task) }
+ }
+ 
+ async fn debounce_task<F>(
+@@ -52,7 +53,10 @@ async fn debounce_task<F>(
+             _ = &mut cancel_rx => break,
+             _ = rx.recv() => continue,
+             _ = livekit_runtime::sleep(duration) => {
+-                future.await;
++                tokio::select! {
++                    _ = &mut cancel_rx => {},
++                    _ = future => {},
++                }
+                 break;
+             }
+         }
+@@ -60,6 +64,15 @@ async fn debounce_task<F>(
+ }
+ 
+ impl Debouncer {
++    pub async fn cancel(mut self) {
++        if let Some(cancel) = self.cancel_tx.take() {
++            let _ = cancel.send(());
++        }
++        if let Some(task) = self.task.take() {
++            let _ = task.await;
++        }
++    }
++
+     pub fn call(&self) -> Result<(), mpsc::error::SendError<()>> {
+         self.tx.send(())
+     }
+@@ -67,6 +80,41 @@ impl Debouncer {
+ 
+ impl Drop for Debouncer {
+     fn drop(&mut self) {
+-        let _ = self.cancel_tx.take().unwrap().send(());
++        if let Some(cancel) = self.cancel_tx.take() {
++            let _ = cancel.send(());
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::Arc;
++
++    #[tokio::test]
++    async fn cancellation_releases_pending_future() {
++        let owner = Arc::new(());
++        let weak = Arc::downgrade(&owner);
++        let debouncer = debounce(Duration::from_secs(60), async move {
++            let _owner = owner;
++            panic!("cancelled debounce must not execute");
++        });
++        tokio::time::timeout(Duration::from_secs(1), debouncer.cancel()).await.unwrap();
++        assert!(weak.upgrade().is_none());
++    }
++
++    #[tokio::test]
++    async fn cancellation_joins_running_future() {
++        let owner = Arc::new(());
++        let weak = Arc::downgrade(&owner);
++        let (started_tx, started_rx) = oneshot::channel();
++        let debouncer = debounce(Duration::ZERO, async move {
++            let _owner = owner;
++            let _ = started_tx.send(());
++            std::future::pending::<()>().await;
++        });
++        tokio::time::timeout(Duration::from_secs(1), started_rx).await.unwrap().unwrap();
++        tokio::time::timeout(Duration::from_secs(1), debouncer.cancel()).await.unwrap();
++        assert!(weak.upgrade().is_none());
+     }
  }
 diff --git a/webrtc-sys/include/livekit/encoded_reference_continuity.h b/webrtc-sys/include/livekit/encoded_reference_continuity.h
 new file mode 100644

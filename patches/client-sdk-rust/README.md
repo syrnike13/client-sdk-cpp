@@ -1,5 +1,14 @@
 # Native v2 Rust patch
 
+The v1.10.0-syrnike.9 candidate has normalized tree
+`8f5c3220de048f23a8f17b4a65653be3c5b11179`. Session shutdown now cancels
+and joins publisher negotiation tasks before closing signaling and peer
+connections. Fast negotiation includes its answer wait; debounced negotiation
+can be cancelled both before and during execution. Closed-session checks share
+the task-creation locks with shutdown so no task can escape the drain. See
+[`docs/negotiation-shutdown.md`](../../docs/negotiation-shutdown.md) for the
+focused reproduction and validation.
+
 The submodule pins the published upstream commit
 `1a477bc422c6890537b3bcdb017f0ac094d49661` (livekit-ffi/v0.12.75).
 `0001-native-v2-runtime.patch` contains the callback-cycle cleanup, publisher

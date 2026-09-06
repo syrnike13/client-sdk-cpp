@@ -25,6 +25,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -36,6 +37,11 @@ using namespace std::chrono_literals;
 namespace livekit {
 
 struct RoomTestAccess {
+  static bool connectBeforeRequest(Room& room, const std::string& url, const std::string& token,
+                                   const RoomOptions& options, const std::function<void()>& before_request) {
+    return room.connectImpl(url, token, options, before_request);
+  }
+
   static int listenerId(const Room& room) {
     const std::scoped_lock<std::mutex> guard(room.lock_);
     return room.listener_id_;
@@ -352,21 +358,29 @@ TEST_F(RoomTest, LateConnectionAfterDisconnectRemainsRecoverable) {
 
   Room room;
   RoomOptions options;
-  auto connect_future =
-      std::async(std::launch::async, [&room, this, &options]() { return room.connect(server_url_, token_, options); });
+  std::promise<void> entered;
+  auto entered_future = entered.get_future();
+  std::promise<void> release;
+  auto release_future = release.get_future().share();
+  auto connect_future = std::async(std::launch::async, [&] {
+    return RoomTestAccess::connectBeforeRequest(room, server_url_, token_, options, [&] {
+      entered.set_value();
+      if (release_future.wait_for(5s) != std::future_status::ready) {
+        throw std::runtime_error("disconnect race gate timed out");
+      }
+    });
+  });
 
-  // Wait until connect() installs its listener immediately before starting the
-  // blocking FFI connection, then invalidate that in-flight attempt.
-  const auto deadline = std::chrono::steady_clock::now() + 5s;
-  while (RoomTestAccess::listenerId(room) == 0 && connect_future.wait_for(0ms) != std::future_status::ready &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-  }
+  const bool gate_entered = entered_future.wait_for(5s) == std::future_status::ready;
+  const auto state_before_disconnect = room.connectionState();
+  const auto listener_before_disconnect = RoomTestAccess::listenerId(room);
+  const bool disconnected = gate_entered && room.disconnect();
+  release.set_value();
 
-  ASSERT_EQ(room.connectionState(), ConnectionState::Reconnecting)
-      << "connect completed before the test could exercise the disconnect race";
-  ASSERT_NE(RoomTestAccess::listenerId(room), 0);
-  ASSERT_TRUE(room.disconnect()) << "disconnect should claim the in-progress connection";
+  ASSERT_TRUE(gate_entered) << "connect did not reach the request gate";
+  ASSERT_EQ(state_before_disconnect, ConnectionState::Reconnecting);
+  ASSERT_NE(listener_before_disconnect, 0);
+  ASSERT_TRUE(disconnected) << "disconnect should claim the in-progress connection";
 
   // This preserves the existing behavior on main: the in-flight connect can
   // still complete, but the Room must not become permanently unshuttable.

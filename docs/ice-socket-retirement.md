@@ -46,6 +46,12 @@ STUN/TURN setup, had maximum forward growth 13 (previous release: 16), and
 returned to the same 266 handles after SDK shutdown. These Room counts contain
 other SDK resources and are not the deterministic cause proof.
 
+A later final-bundle application run still reached 17 handles of maximum
+forward growth for both backends against the application's 16-handle limit.
+That run remains rejected and is being diagnosed separately. The deterministic
+socket-retirement control establishes this fix's scope; it does not establish
+that all application process resource growth has been eliminated.
+
 The application capture/encoder/audio/neutral-observer run completed all 30
 WGC/DXGI switches: 58.37 decoded fps, p95 frame age 93 ms, zero Room reconnects,
 maximum forward handle growth WGC 11 / DXGI 13 against the unchanged limit 16,

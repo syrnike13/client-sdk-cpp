@@ -342,6 +342,9 @@ public:
 private:
   friend struct RoomTestAccess;
 
+  bool connectImpl(const std::string& url, const std::string& token, const RoomOptions& options,
+                   const std::function<void()>& before_request);
+
   mutable std::mutex lock_;
   ConnectionState connection_state_ = ConnectionState::Disconnected;
   RoomDelegate* delegate_ = nullptr; // Not owned

@@ -90,6 +90,11 @@ void Room::setDelegate(RoomDelegate* delegate) {
 }
 
 bool Room::connect(const std::string& url, const std::string& token, const RoomOptions& options) {
+  return connectImpl(url, token, options, {});
+}
+
+bool Room::connectImpl(const std::string& url, const std::string& token, const RoomOptions& options,
+                       const std::function<void()>& before_request) {
   TRACE_EVENT0("livekit", "Room::connect");
 
   if (!FfiClient::instance().isInitialized()) {
@@ -113,6 +118,11 @@ bool Room::connect(const std::string& url, const std::string& token, const RoomO
       listener_id_ = listenerId;
     }
 
+    // The private test seam synchronizes disconnect after listener ownership
+    // is installed and before the request can complete. Production has no hook.
+    if (before_request) {
+      before_request();
+    }
     auto fut = FfiClient::instance().connectAsync(url, token, options);
     auto connectCb = fut.get(); // fut will throw if it fails to connect to the room
 

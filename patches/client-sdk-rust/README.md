@@ -17,7 +17,7 @@ A single patch permits strict forward/reverse applicability checks
 even where the former patches changed one another's context. CMake applies it
 on a clean checkout and verifies its reverse on reconfiguration.
 
-The next revision has normalized tree
+v1.10.0-syrnike.7 has normalized tree
 `8f653241fab0416c9c0a2da37398d90bc25790a3` and also fences pre-encoded reference continuity across WebRTC
 encoder-queue drops. Capture assigns a private ingress sequence before handing
 an encoded buffer to WebRTC; every pass-through encoder tracks its own sequence
@@ -25,6 +25,18 @@ and source identity. A missing access unit or failed encoded-image callback
 requires a fresh keyframe before forwarding dependent frames. Raw capture
 sequence gaps, timestamp alignment and the public SDK API remain independent
 of this private sequence. The state has constant size and adds no queue or wait.
+
+v1.10.0-syrnike.8 has normalized tree
+`4f24fb875460568d7cf2d1f38f491ce104123281`. It gives ICE UDP/STUN/TURN
+sockets to individual ports instead of retained allocation sequences. In the
+pinned WebRTC build, failed-network regathering prunes ports while retaining
+the sequence's shared UDP socket until session teardown. The injected allocator
+clears only the session's shared-socket flag after the peer connection applies
+its defaults. Continual gathering, all network types, ICE transports and the
+public SDK API remain unchanged. Network manager and packet socket factory
+retain the same factory/connection-context lifetime as the default allocator.
+
+See [the deterministic socket-retirement reproduction](../../docs/ice-socket-retirement.md).
 
 The unsuccessful tag v1.10.0-syrnike.3 referenced the unpublished Rust commit
 and produced no release assets. v1.10.0-syrnike.4 is the reproducible successor.

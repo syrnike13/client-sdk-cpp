@@ -114,7 +114,7 @@ index 00a7a919..b033b780 100644
          self.handle.sender()
      }
 diff --git a/livekit-ffi/protocol/ffi.proto b/livekit-ffi/protocol/ffi.proto
-index 53ea782b..d5615aa4 100644
+index 53ea782b..1d03c91c 100644
 --- a/livekit-ffi/protocol/ffi.proto
 +++ b/livekit-ffi/protocol/ffi.proto
 @@ -89,6 +89,9 @@ message FfiRequest {
@@ -132,7 +132,7 @@ index 53ea782b..d5615aa4 100644
      ReadyForRoomEventRequest ready_for_room_event = 83;
  
 -    // NEXT_ID: 87
-+    // NEXT_ID: 89
++    // NEXT_ID: 90
    }
  }
  
@@ -151,7 +151,7 @@ index 53ea782b..d5615aa4 100644
      ReadyForRoomEventResponse ready_for_room_event = 82;
  
 -    // NEXT_ID: 87
-+    // NEXT_ID: 89
++    // NEXT_ID: 90
    }
  }
  

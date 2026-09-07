@@ -13,6 +13,22 @@ index 00000000..0dffd207
 +FFI read and retain WebRTC frame backpressure for external encoders. The bitrate
 +request does not change source dimensions or target FPS, and is distinct from a
 +fresh network-capacity estimate. Reference continuity remains fenced after drops.
+diff --git a/.changeset/preencoded-keyframe-pacing.md b/.changeset/preencoded-keyframe-pacing.md
+new file mode 100644
+index 00000000..c87c547b
+--- /dev/null
++++ b/.changeset/preencoded-keyframe-pacing.md
+@@ -0,0 +1,10 @@
++---
++webrtc-sys: patch
++---
++
++Enable WebRTC keyframe queue flushing in the zero-playout-delay factory. When the first packet
++of a new keyframe arrives, superseded queued packets for that video stream and
++its RTX stream are removed unless another keyframe is still being paced.
++Audio and unrelated streams retain their queues. This bounds recovery work
++without dropping arbitrary encoded references, changing capture cadence, or
++replacing an encoder or publication.
 diff --git a/.changeset/preencoded-raw-admission.md b/.changeset/preencoded-raw-admission.md
 new file mode 100644
 index 00000000..2aeab771
@@ -1700,7 +1716,7 @@ index 6b6f6028..c8fe0fb2 100644
    observer_->on_ice_candidates_removed(std::move(vec));
  }
 diff --git a/webrtc-sys/src/peer_connection_factory.cpp b/webrtc-sys/src/peer_connection_factory.cpp
-index fe76067f..02463b1c 100644
+index fe76067f..c6d2b1c7 100644
 --- a/webrtc-sys/src/peer_connection_factory.cpp
 +++ b/webrtc-sys/src/peer_connection_factory.cpp
 @@ -19,21 +19,21 @@
@@ -1739,7 +1755,7 @@ index fe76067f..02463b1c 100644
  #include "rtc_base/thread.h"
  #include "webrtc-sys/src/peer_connection.rs.h"
  #include "webrtc-sys/src/peer_connection_factory.rs.h"
-@@ -49,6 +52,27 @@
+@@ -49,25 +52,52 @@
  namespace livekit_ffi {
  namespace {
  
@@ -1767,7 +1783,35 @@ index fe76067f..02463b1c 100644
  constexpr char kForcePlayoutDelayFieldTrial[] =
      "WebRTC-ForcePlayoutDelay/min_ms:0,max_ms:0/";
  constexpr char kForcePlayoutDelayValue[] = "min_ms:0,max_ms:0";
-@@ -83,14 +107,24 @@ PeerConnectionFactory::PeerConnectionFactory(
+ 
+-class ZeroPlayoutDelayFieldTrials final : public webrtc::FieldTrialsView {
++class RealtimeMediaFieldTrials final : public webrtc::FieldTrialsView {
+  public:
+   std::string Lookup(absl::string_view key) const override {
++    // A new random-access frame supersedes queued dependent video. WebRTC
++    // flushes only that stream and its RTX packets, and never interrupts a
++    // keyframe already being paced. Audio and other streams keep their queues.
++    if (key == "WebRTC-Pacer-KeyframeFlushing") {
++      return "Enabled";
++    }
+     return key == "WebRTC-ForcePlayoutDelay" ? kForcePlayoutDelayValue : "";
+   }
+ 
+   std::unique_ptr<webrtc::FieldTrialsView> CreateCopy() const override {
+-    return std::make_unique<ZeroPlayoutDelayFieldTrials>();
++    return std::make_unique<RealtimeMediaFieldTrials>();
+   }
+ };
+ 
+ webrtc::Environment CreateEnvironment(bool zero_playout_delay) {
+   if (zero_playout_delay) {
+     return webrtc::CreateEnvironment(
+-        std::make_unique<ZeroPlayoutDelayFieldTrials>());
++        std::make_unique<RealtimeMediaFieldTrials>());
+   }
+   return webrtc::CreateEnvironment();
+ }
+@@ -83,14 +113,24 @@ PeerConnectionFactory::PeerConnectionFactory(
  PeerConnectionFactory::PeerConnectionFactory(
      std::shared_ptr<RtcRuntime> rtc_runtime,
      bool zero_playout_delay)
@@ -1795,7 +1839,7 @@ index fe76067f..02463b1c 100644
    dependencies.env = env_;
  
    if (zero_playout_delay) {
-@@ -111,9 +145,12 @@ PeerConnectionFactory::PeerConnectionFactory(
+@@ -111,9 +151,12 @@ PeerConnectionFactory::PeerConnectionFactory(
        std::move(std::make_unique<livekit_ffi::VideoEncoderFactory>());
    dependencies.video_decoder_factory =
        std::move(std::make_unique<livekit_ffi::VideoDecoderFactory>());
@@ -1811,7 +1855,7 @@ index fe76067f..02463b1c 100644
  
    webrtc::EnableMedia(dependencies);
    peer_factory_ =
-@@ -130,17 +167,26 @@ PeerConnectionFactory::~PeerConnectionFactory() {
+@@ -130,17 +173,26 @@ PeerConnectionFactory::~PeerConnectionFactory() {
  
    peer_factory_ = nullptr;
    audio_device_ = nullptr;
@@ -1841,7 +1885,7 @@ index fe76067f..02463b1c 100644
      throw std::runtime_error(serialize_error(to_error(webrtc::RTCError(
          webrtc::RTCErrorType::INTERNAL_ERROR, "failed to initialize pc"))));
    }
-@@ -197,7 +243,8 @@ RtpCapabilities PeerConnectionFactory::rtp_receiver_capabilities(
+@@ -197,7 +249,8 @@ RtpCapabilities PeerConnectionFactory::rtp_receiver_capabilities(
        static_cast<webrtc::MediaType>(type)));
  }
  

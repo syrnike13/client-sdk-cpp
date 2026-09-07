@@ -1,5 +1,22 @@
 # Native v2 Rust patch
 
+The keyframe pacing correction enables WebRTC's existing
+`WebRTC-Pacer-KeyframeFlushing` behavior in the zero-playout-delay factory
+environment; the default factory remains unchanged. On the first
+packet of a new keyframe, the pacer removes superseded queued video and RTX
+packets for that stream. A keyframe already being paced is preserved; audio and
+other stream queues are unaffected. It does not impose a frame quota or change
+encoder, source, publication identity, or the selected screen preset.
+
+The pinned WebRTC implementation and its `FlushesPacketsOnKeyFrames` test are
+in [pacing_controller.cc](https://webrtc.googlesource.com/src/+/refs/branch-heads/7559/modules/pacing/pacing_controller.cc)
+and [pacing_controller_unittest.cc](https://webrtc.googlesource.com/src/+/refs/branch-heads/7559/modules/pacing/pacing_controller_unittest.cc).
+Two app #139 preview-stall candidate runs passed the unchanged full-interval
+receiver threshold: p95 132/133 ms, maximum gap 532/467 ms, zero invalid CRC
+markers, continuous screen audio/remote voice, and unchanged publication and
+encoder identity. These candidate runs do not replace qualification of the
+published SDK pin in the application repository.
+
 The v1.10.0-syrnike.9 candidate has normalized tree
 `8f5c3220de048f23a8f17b4a65653be3c5b11179`. Session shutdown now cancels
 and joins publisher negotiation tasks before closing signaling and peer

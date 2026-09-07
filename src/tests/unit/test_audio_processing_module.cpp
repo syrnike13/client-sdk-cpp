@@ -18,6 +18,7 @@
 #include <livekit/audio_frame.h>
 #include <livekit/audio_processing_module.h>
 #include <livekit/livekit.h>
+#include <livekit/realtime_audio_processing.h>
 
 #include <algorithm>
 #include <cmath>
@@ -26,6 +27,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace livekit::test {
@@ -883,6 +885,70 @@ TEST_F(AudioProcessingModuleTest, AGCWithNoiseSuppressionCombined) {
 
   // Should have reasonable output energy (AGC boosted, NS cleaned)
   EXPECT_GT(avg_output_energy, 100.0) << "Combined AGC+NS should produce reasonable output";
+}
+
+TEST_F(AudioProcessingModuleTest, RealtimeBypassAndOwnerContract) {
+  RealtimeAudioProcessing processor;
+  std::array<std::int16_t, 480> samples{};
+  samples.fill(1234);
+  const auto original = samples;
+  EXPECT_EQ(processor.process(samples, nullptr, 0, false, true), RealtimeAudioProcessingResult::ok);
+  EXPECT_EQ(samples, original);
+  EXPECT_EQ(processor.process(samples, nullptr, 501, false, false), RealtimeAudioProcessingResult::invalid_input);
+  EXPECT_EQ(samples, original);
+  auto result = RealtimeAudioProcessingResult::ok;
+  std::thread other([&] { result = processor.process(samples, nullptr, 0, false, false); });
+  other.join();
+  EXPECT_EQ(result, RealtimeAudioProcessingResult::wrong_thread);
+  EXPECT_EQ(samples, original);
+}
+
+TEST_F(AudioProcessingModuleTest, RealtimeIndependentNoiseAndLifecycle) {
+  std::uint32_t seed = 123;
+  for (int cycle = 0; cycle < 20; ++cycle) {
+    RealtimeAudioProcessing processor;
+    double input_energy = 0;
+    double output_energy = 0;
+    for (int frame = 0; frame < 300; ++frame) {
+      std::array<std::int16_t, 480> samples{};
+      for (auto& sample : samples) {
+        seed = seed * 1664525 + 1013904223;
+        sample = static_cast<std::int16_t>((seed >> 20) - 2048);
+        if (frame >= 150) input_energy += static_cast<double>(sample) * sample;
+      }
+      ASSERT_EQ(processor.process(samples, nullptr, 0, true, true), RealtimeAudioProcessingResult::ok);
+      if (frame >= 150)
+        for (const auto sample : samples) output_energy += static_cast<double>(sample) * sample;
+    }
+    EXPECT_LT(output_energy, input_energy * 0.5) << "NS must work with unavailable AEC reference";
+  }
+}
+
+TEST_F(AudioProcessingModuleTest, RealtimeSyntheticEcho) {
+  RealtimeAudioProcessing processor;
+  std::array<std::array<std::int16_t, 480>, 4> history{};
+  std::uint32_t seed = 0x12345678;
+  double input_energy = 0;
+  double output_energy = 0;
+  for (std::size_t frame = 0; frame < 1500; ++frame) {
+    auto& reference = history[frame % history.size()];
+    for (auto& sample : reference) {
+      seed = seed * 1664525 + 1013904223;
+      sample = static_cast<std::int16_t>(static_cast<int>(seed >> 16) * 12000 / 32768 - 12000);
+    }
+    const auto& delayed = history[(frame + 1) % history.size()];
+    std::array<std::int16_t, 480> microphone{};
+    for (std::size_t index = 0; index < microphone.size(); ++index) {
+      const auto previous = index ? delayed[index - 1] : 0;
+      microphone[index] = static_cast<std::int16_t>(delayed[index] * 0.55 + previous * 0.2);
+      if (frame >= 500) input_energy += static_cast<double>(microphone[index]) * microphone[index];
+    }
+    ASSERT_EQ(processor.process(microphone, &reference, 30, false, true), RealtimeAudioProcessingResult::ok);
+    if (frame >= 500)
+      for (const auto sample : microphone) output_energy += static_cast<double>(sample) * sample;
+  }
+  const auto erle_db = 10 * std::log10(input_energy / std::max(output_energy, 1.0));
+  EXPECT_GE(erle_db, 10.0) << "AEC must suppress the delayed reference independently of NS";
 }
 
 } // namespace livekit::test

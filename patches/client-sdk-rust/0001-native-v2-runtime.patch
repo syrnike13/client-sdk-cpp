@@ -1,3 +1,18 @@
+diff --git a/.changeset/microphone-realtime-apm.md b/.changeset/microphone-realtime-apm.md
+new file mode 100644
+index 00000000..aea85aa7
+--- /dev/null
++++ b/.changeset/microphone-realtime-apm.md
+@@ -0,0 +1,9 @@
++---
++livekit-ffi: patch
++libwebrtc: patch
++webrtc-sys: patch
++---
++
++Add an exclusively owned, fixed-frame microphone AEC/NS seam that avoids
++protobuf serialization, global FFI handles and error-string allocation on the
++processing path. Existing AudioProcessingModule APIs remain unchanged.
 diff --git a/.changeset/preencoded-bitrate-feedback.md b/.changeset/preencoded-bitrate-feedback.md
 new file mode 100644
 index 00000000..0dffd207
@@ -78,6 +93,49 @@ index 00000000..5896d522
 +replacement screen track. Return an absent track safely for inactive senders.
 +This preserves bounded transceiver reuse while allowing the SFU to associate
 +new RTP media with the replacement publication.
+diff --git a/libwebrtc/src/native/apm.rs b/libwebrtc/src/native/apm.rs
+index a5c53fb9..f40b204d 100644
+--- a/libwebrtc/src/native/apm.rs
++++ b/libwebrtc/src/native/apm.rs
+@@ -22,6 +22,38 @@ pub struct AudioProcessingModule {
+ }
+ 
+ impl AudioProcessingModule {
++    /// Process one fixed 48 kHz mono frame without constructing an error string.
++    pub fn process_10ms(&mut self, data: &mut [i16; 480], reverse: bool) -> i32 {
++        // SAFETY: The fixed array is aligned, valid for 480 i16 samples, and
++        // exclusively borrowed. WebRTC supports in-place processing.
++        unsafe {
++            if reverse {
++                self.sys_handle.pin_mut().process_reverse_stream(
++                    data.as_ptr(),
++                    480,
++                    data.as_mut_ptr(),
++                    480,
++                    48_000,
++                    1,
++                )
++            } else {
++                self.sys_handle.pin_mut().process_stream(
++                    data.as_ptr(),
++                    480,
++                    data.as_mut_ptr(),
++                    480,
++                    48_000,
++                    1,
++                )
++            }
++        }
++    }
++
++    /// Set the fixed-frame processor delay without allocating an error value.
++    pub fn set_realtime_delay_ms(&mut self, delay_ms: i32) -> i32 {
++        self.sys_handle.pin_mut().set_stream_delay_ms(delay_ms)
++    }
++
+     pub fn new(
+         echo_canceller_enabled: bool,
+         gain_controller_enabled: bool,
 diff --git a/libwebrtc/src/native/rtp_transceiver.rs b/libwebrtc/src/native/rtp_transceiver.rs
 index 3bd4fb59..a6a089bc 100644
 --- a/libwebrtc/src/native/rtp_transceiver.rs
@@ -260,6 +318,140 @@ index 4922add5..281dcfc7 100644
          ];
  
          for (proto_backend, expected) in cases {
+diff --git a/livekit-ffi/src/lib.rs b/livekit-ffi/src/lib.rs
+index 06695660..9c71e3fd 100644
+--- a/livekit-ffi/src/lib.rs
++++ b/livekit-ffi/src/lib.rs
+@@ -19,6 +19,7 @@ use livekit::prelude::*;
+ use thiserror::Error;
+ 
+ mod conversion;
++mod realtime_apm;
+ 
+ pub mod cabi;
+ pub mod proto;
+diff --git a/livekit-ffi/src/realtime_apm.rs b/livekit-ffi/src/realtime_apm.rs
+new file mode 100644
+index 00000000..a13fa9f4
+--- /dev/null
++++ b/livekit-ffi/src/realtime_apm.rs
+@@ -0,0 +1,116 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//! Fixed-frame, exclusively owned microphone DSP seam. This has no FFI server
++//! handle table, protobuf, mutex, event, callback or asynchronous operation.
++
++use livekit::webrtc::native::apm::AudioProcessingModule;
++use std::{ffi::c_void, mem::align_of, panic, ptr};
++
++struct RealtimeApm {
++    echo: AudioProcessingModule,
++    noise: AudioProcessingModule,
++}
++
++/// Allocate and prewarm the two independent processors on their future owner.
++#[no_mangle]
++pub extern "C" fn livekit_ffi_realtime_apm_create() -> *mut c_void {
++    panic::catch_unwind(|| {
++        let mut apm = Box::new(RealtimeApm {
++            echo: AudioProcessingModule::new(true, false, false, false),
++            noise: AudioProcessingModule::new(false, false, false, true),
++        });
++        let mut reference = [0i16; 480];
++        let mut microphone = [0i16; 480];
++        let mut seed = 1u32;
++        for _ in 0..200 {
++            for sample in &mut reference {
++                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
++                *sample = ((seed >> 20) as i16) - 2048;
++            }
++            microphone.copy_from_slice(&reference);
++            if apm.echo.set_realtime_delay_ms(0) != 0
++                || apm.echo.process_10ms(&mut reference, true) != 0
++                || apm.echo.process_10ms(&mut microphone, false) != 0
++                || apm.noise.process_10ms(&mut microphone, false) != 0
++            {
++                return ptr::null_mut();
++            }
++        }
++        Box::into_raw(apm).cast()
++    })
++    .unwrap_or(ptr::null_mut())
++}
++
++/// Release a processor on the same owner after all processing calls finish.
++///
++/// # Safety
++/// `handle` must be null or a live pointer returned by create, consumed exactly
++/// once. It must not be accessed concurrently or after this call.
++#[no_mangle]
++pub unsafe extern "C" fn livekit_ffi_realtime_apm_destroy(handle: *mut c_void) {
++    if !handle.is_null() {
++        // SAFETY: Exclusive ownership is returned under the documented contract.
++        drop(unsafe { Box::from_raw(handle.cast::<RealtimeApm>()) });
++    }
++}
++
++/// Process one 48 kHz mono/10 ms frame. Returns 0=ok, 1=invalid input, 2=DSP failure.
++///
++/// # Safety
++/// `handle` is a live, exclusively accessed create result. `microphone` points
++/// to exactly 480 writable i16 samples. `reference` is null or 480 readable i16
++/// samples. All storage remains valid for this synchronous call.
++#[no_mangle]
++pub unsafe extern "C" fn livekit_ffi_realtime_apm_process(
++    handle: *mut c_void,
++    microphone: *mut i16,
++    samples: usize,
++    reference: *const i16,
++    delay_ms: u32,
++    noise_suppression: bool,
++    echo_cancellation: bool,
++) -> i32 {
++    if handle.is_null()
++        || microphone.is_null()
++        || samples != 480
++        || microphone as usize % align_of::<i16>() != 0
++        || reference as usize % align_of::<i16>() != 0
++        || delay_ms > 500
++    {
++        return 1;
++    }
++    let mut reverse = [0i16; 480];
++    if !reference.is_null() {
++        // SAFETY: Caller guarantees the 480 samples. Copy before borrowing the
++        // microphone, allowing callers to use the same storage without aliasing.
++        unsafe { ptr::copy_nonoverlapping(reference, reverse.as_mut_ptr(), 480) };
++    }
++    // SAFETY: Validated dimensions/alignment and exclusive caller-owned storage.
++    let apm = unsafe { &mut *handle.cast::<RealtimeApm>() };
++    // SAFETY: The caller supplies exactly one writable fixed frame.
++    let microphone = unsafe { &mut *microphone.cast::<[i16; 480]>() };
++    if echo_cancellation && !reference.is_null() {
++        if apm.echo.set_realtime_delay_ms(delay_ms as i32) != 0
++            || apm.echo.process_10ms(&mut reverse, true) != 0
++            || apm.echo.process_10ms(microphone, false) != 0
++        {
++            return 2;
++        }
++    }
++    if noise_suppression && apm.noise.process_10ms(microphone, false) != 0 {
++        return 2;
++    }
++    0
++}
 diff --git a/livekit-ffi/src/server/requests.rs b/livekit-ffi/src/server/requests.rs
 index 8ee56988..95f1c87c 100644
 --- a/livekit-ffi/src/server/requests.rs

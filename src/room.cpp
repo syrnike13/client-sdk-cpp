@@ -363,6 +363,23 @@ ConnectionState Room::connectionState() const {
   return connection_state_;
 }
 
+RemotePublicationSnapshot Room::remotePublications(std::size_t maximum) const {
+  maximum = std::min(maximum, std::size_t{4096});
+  RemotePublicationSnapshot snapshot;
+  snapshot.entries.reserve(maximum);
+  const std::scoped_lock<std::mutex> guard(lock_);
+  for (const auto& participant : remote_participants_) {
+    for (const auto& publication : participant.second->trackPublications()) {
+      if (snapshot.entries.size() == maximum) {
+        snapshot.truncated = true;
+        return snapshot;
+      }
+      snapshot.entries.push_back({participant.second, publication.second});
+    }
+  }
+  return snapshot;
+}
+
 std::future<SessionStats> Room::getStats() const {
   std::shared_ptr<FfiHandle> handle;
   {

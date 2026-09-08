@@ -408,6 +408,7 @@ add_library(livekit SHARED
   src/realtime_audio_processing.cpp
   src/audio_source.cpp
   src/audio_stream.cpp
+  src/fresh_audio_stream.cpp
   src/data_track_frame.cpp
   src/data_stream.cpp
   src/data_track_error.cpp

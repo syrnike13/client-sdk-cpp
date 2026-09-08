@@ -31,6 +31,14 @@
 namespace livekit {
 
 struct RoomTestAccess {
+  static void setRemoteParticipant(Room& room, std::shared_ptr<RemoteParticipant> participant) {
+    const std::scoped_lock<std::mutex> guard(room.lock_);
+    room.remote_participants_.clear();
+    if (participant) {
+      room.remote_participants_.emplace(participant->identity(), std::move(participant));
+    }
+  }
+
   static void installConnectedListener(Room& room, std::atomic<int>& callback_count) {
     const auto listener_id = FfiClient::instance().addListener([&room, &callback_count](const proto::FfiEvent& event) {
       callback_count.fetch_add(1, std::memory_order_relaxed);
@@ -86,6 +94,37 @@ public:
 };
 
 } // namespace
+
+TEST_F(RoomTest, PublicationSnapshotBoundsAndRetainsRemovedHandles) {
+  Room room;
+  EXPECT_FALSE(room.remotePublications(0).truncated);
+  auto participant = std::make_shared<RemoteParticipant>(FfiHandle{}, "participant-sid", "name", "identity", "",
+                                                         std::unordered_map<std::string, std::string>{},
+                                                         ParticipantKind::Standard, DisconnectReason::Unknown);
+  for (std::size_t index = 0; index < 4097; ++index) {
+    proto::OwnedTrackPublication owned;
+    const auto sid = "publication-" + std::to_string(index);
+    owned.mutable_info()->set_sid(sid);
+    participant->mutableTrackPublications().emplace(sid, std::make_shared<RemoteTrackPublication>(owned));
+  }
+  RoomTestAccess::setRemoteParticipant(room, participant);
+  EXPECT_TRUE(room.remotePublications(0).truncated);
+  auto single = room.remotePublications(1);
+  ASSERT_EQ(single.entries.size(), 1);
+  EXPECT_TRUE(single.truncated);
+  const auto capped = room.remotePublications(5000);
+  EXPECT_EQ(capped.entries.size(), 4096);
+  EXPECT_TRUE(capped.truncated);
+  const auto retained_sid = single.entries.front().publication->sid();
+  participant->mutableTrackPublications().clear();
+  participant->mutableTrackPublications().emplace(retained_sid, single.entries.front().publication);
+  EXPECT_FALSE(room.remotePublications(1).truncated);
+  RoomTestAccess::setRemoteParticipant(room, nullptr);
+  participant.reset();
+  EXPECT_TRUE(room.remotePublications(1).entries.empty());
+  EXPECT_EQ(single.entries.front().publication->sid(), retained_sid);
+  EXPECT_EQ(single.entries.front().participant->identity(), "identity");
+}
 
 TEST_F(RoomTest, ConnectWithoutInitialize) {
   // Test fixture initializes by default, do this to emulate lack of initialization

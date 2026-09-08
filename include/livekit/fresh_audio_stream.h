@@ -78,5 +78,6 @@ private:
   const std::thread::id owner_ = std::this_thread::get_id();
   FreshAudioStreamStats stats_;
   std::uint64_t bridge_stale_ = 0;
+  std::uint64_t delivered_sequence_ = 0;
 };
 } // namespace livekit

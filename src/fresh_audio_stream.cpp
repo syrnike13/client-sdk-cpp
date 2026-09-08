@@ -79,7 +79,10 @@ FreshAudioReadResult FreshAudioStream::tryRead(FreshAudioFrame& output, std::uin
     ++stats_.stale;
     return FreshAudioReadResult::empty;
   }
-  next.discontinuity = info.discontinuity != 0;
+  // Rust may already have consumed a frame that expired during the C++ bridge.
+  // Compare delivered sequences too, so that drop remains visible to callers.
+  next.discontinuity = info.discontinuity != 0 || next.sequence != delivered_sequence_ + 1;
+  delivered_sequence_ = next.sequence;
   output = next;
   return FreshAudioReadResult::frame;
 }

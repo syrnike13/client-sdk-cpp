@@ -109,6 +109,7 @@ TEST_F(AudioSourceTest, FreshSinkExpiresOldFramesAndConvertsFormat) {
   ASSERT_EQ(stream.tryRead(output, 1'000'000), FreshAudioReadResult::frame);
   EXPECT_EQ(output.samples[400], output.samples[401]);
   EXPECT_GT(output.samples[400], 1000);
+  EXPECT_TRUE(output.discontinuity);
   EXPECT_EQ(stream.stats().invalid, 0u);
 }
 

@@ -43,6 +43,15 @@ class E2EEManager;
 class LocalParticipant;
 class RemoteParticipant;
 
+struct RemotePublicationSnapshot {
+  struct Entry {
+    std::shared_ptr<RemoteParticipant> participant;
+    std::shared_ptr<RemoteTrackPublication> publication;
+  };
+  std::vector<Entry> entries;
+  bool truncated = false;
+};
+
 /// Represents a single ICE server configuration.
 struct IceServer {
   /// TURN/STUN server URL (e.g. "stun:stun.l.google.com:19302").
@@ -236,6 +245,12 @@ public:
   ///   handle can be promoted with @c lock(); a handle becomes empty once the
   ///   corresponding participant disconnects or the room is torn down.
   std::vector<std::weak_ptr<RemoteParticipant>> remoteParticipants() const;
+
+  /// Copies publication handles under the Room lock, including publications
+  /// present before connect (which do not emit onTrackPublished). Use on a
+  /// control thread. Capacity is capped at 4096; truncation is explicit.
+  /// Handles own their lifetimes, but later Room events can supersede them.
+  [[nodiscard]] RemotePublicationSnapshot remotePublications(std::size_t maximum) const;
 
   /// Returns the current connection state of the room.
   ConnectionState connectionState() const;

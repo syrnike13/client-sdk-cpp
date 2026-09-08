@@ -1,3 +1,18 @@
+diff --git a/.changeset/fresh-audio-ingress.md b/.changeset/fresh-audio-ingress.md
+new file mode 100644
+index 00000000..8c07b23f
+--- /dev/null
++++ b/.changeset/fresh-audio-ingress.md
+@@ -0,0 +1,9 @@
++---
++livekit-ffi: patch
++libwebrtc: patch
++webrtc-sys: patch
++---
++
++Add a fixed-capacity native decoded audio ingress with monotonic frame age,
++nonblocking access, explicit drop counters and deterministic track-bound
++ownership for fresh playout. The existing asynchronous AudioStream API is unchanged.
 diff --git a/.changeset/microphone-realtime-apm.md b/.changeset/microphone-realtime-apm.md
 new file mode 100644
 index 00000000..aea85aa7
@@ -76,6 +91,20 @@ index 00000000..d267a689
 +The pass-through encoder requests a fresh keyframe and suppresses dependent
 +access units until it arrives, instead of forwarding a damaged reference chain.
 +Continuity is private to each encoder and resets on encoder/source replacement.
+diff --git a/.changeset/publisher-wire-msid.md b/.changeset/publisher-wire-msid.md
+new file mode 100644
+index 00000000..9a1363bb
+--- /dev/null
++++ b/.changeset/publisher-wire-msid.md
+@@ -0,0 +1,8 @@
++---
++"livekit": patch
++---
++
++Keep the immutable libwebrtc sender MSID in the local SDP when reusing a
++publisher transceiver. Apply the current AddTrack identity only to the offer
++sent to the SFU, so a later unrelated negotiation does not remove the replacement
++publication. Transceiver reuse and its resource bound remain enabled.
 diff --git a/.changeset/reused-screen-sender.md b/.changeset/reused-screen-sender.md
 new file mode 100644
 index 00000000..5896d522
@@ -93,6 +122,20 @@ index 00000000..5896d522
 +replacement screen track. Return an absent track safely for inactive senders.
 +This preserves bounded transceiver reuse while allowing the SFU to associate
 +new RTP media with the replacement publication.
+diff --git a/libwebrtc/src/lib.rs b/libwebrtc/src/lib.rs
+index 97611978..ee40bf25 100644
+--- a/libwebrtc/src/lib.rs
++++ b/libwebrtc/src/lib.rs
+@@ -71,7 +71,8 @@ pub mod native {
+     pub use webrtc_sys::webrtc::ffi::create_random_uuid;
+ 
+     pub use crate::imp::{
+-        apm, audio_mixer, audio_resampler, frame_cryptor, packet_trailer, yuv_helper,
++        apm, audio_mixer, audio_resampler, frame_cryptor, fresh_audio_stream, packet_trailer,
++        yuv_helper,
+     };
+ }
+ 
 diff --git a/libwebrtc/src/native/apm.rs b/libwebrtc/src/native/apm.rs
 index a5c53fb9..f40b204d 100644
 --- a/libwebrtc/src/native/apm.rs
@@ -136,6 +179,396 @@ index a5c53fb9..f40b204d 100644
      pub fn new(
          echo_canceller_enabled: bool,
          gain_controller_enabled: bool,
+diff --git a/libwebrtc/src/native/fresh_audio_stream.rs b/libwebrtc/src/native/fresh_audio_stream.rs
+new file mode 100644
+index 00000000..5d90f21d
+--- /dev/null
++++ b/libwebrtc/src/native/fresh_audio_stream.rs
+@@ -0,0 +1,372 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//! Fixed decoded ingress for native playout. No Tokio task, FFI event queue,
++//! per-frame allocation, receiver waker, or waiting lock in this handoff.
++
++use std::{
++    cell::UnsafeCell,
++    ops::{Deref, DerefMut},
++    sync::{
++        atomic::{AtomicBool, AtomicU64, Ordering},
++        Arc,
++    },
++    time::{Duration, Instant},
++};
++
++use cxx::SharedPtr;
++use webrtc_sys::audio_track as sys_at;
++
++use crate::audio_track::RtcAudioTrack;
++
++/// Samples in one interleaved 48 kHz stereo/10 ms frame.
++pub const FRESH_AUDIO_SAMPLES: usize = 960;
++/// Hard number of retained decoded frames per sink.
++pub const FRESH_AUDIO_CAPACITY: usize = 4;
++
++/// Owned fixed PCM and the monotonic instant preceding its ingress copy.
++#[derive(Clone, Copy)]
++pub struct FreshAudioFrame {
++    pub samples: [i16; FRESH_AUDIO_SAMPLES],
++    pub decoded_at: Instant,
++    pub sequence: u64,
++    pub discontinuity: bool,
++}
++
++/// Bounded ingress counters; no sample-level telemetry callback is emitted.
++#[derive(Clone, Copy, Default)]
++pub struct FreshAudioStats {
++    pub received: u64,
++    pub dropped: u64,
++    pub stale: u64,
++    pub invalid: u64,
++    pub queued: u64,
++}
++
++struct QueueState {
++    frames: [Option<FreshAudioFrame>; FRESH_AUDIO_CAPACITY],
++    head: usize,
++    depth: usize,
++    consumed_sequence: u64,
++}
++
++struct FreshAudioQueue {
++    state: UnsafeCell<QueueState>,
++    busy: AtomicBool,
++    closed: AtomicBool,
++    received: AtomicU64,
++    dropped: AtomicU64,
++    stale: AtomicU64,
++    invalid: AtomicU64,
++    queued: AtomicU64,
++}
++
++// SAFETY: Every access to state requires the single successful acquire CAS in
++// try_state. QueueGuard exclusively borrows it until its release store. No
++// reference into state escapes a guard; frames are copied out as owned values.
++unsafe impl Sync for FreshAudioQueue {}
++
++struct QueueGuard<'a>(&'a FreshAudioQueue);
++
++impl Deref for QueueGuard<'_> {
++    type Target = QueueState;
++    fn deref(&self) -> &Self::Target {
++        // SAFETY: This guard owns the queue's one state access permit.
++        unsafe { &*self.0.state.get() }
++    }
++}
++
++impl DerefMut for QueueGuard<'_> {
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        // SAFETY: This unique guard owns the queue's one state access permit.
++        unsafe { &mut *self.0.state.get() }
++    }
++}
++
++impl Drop for QueueGuard<'_> {
++    fn drop(&mut self) {
++        self.0.busy.store(false, Ordering::Release);
++    }
++}
++
++impl FreshAudioQueue {
++    fn new() -> Self {
++        Self {
++            state: UnsafeCell::new(QueueState {
++                frames: [None; FRESH_AUDIO_CAPACITY],
++                head: 0,
++                depth: 0,
++                consumed_sequence: 0,
++            }),
++            busy: AtomicBool::new(false),
++            closed: AtomicBool::new(false),
++            received: AtomicU64::new(0),
++            dropped: AtomicU64::new(0),
++            stale: AtomicU64::new(0),
++            invalid: AtomicU64::new(0),
++            queued: AtomicU64::new(0),
++        }
++    }
++
++    fn try_state(&self) -> Option<QueueGuard<'_>> {
++        self.busy
++            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
++            .ok()
++            .map(|_| QueueGuard(self))
++    }
++
++    fn push(&self, data: &[i16], decoded_at: Instant) {
++        if self.closed.load(Ordering::Acquire) {
++            return;
++        }
++        if data.len() != FRESH_AUDIO_SAMPLES {
++            self.invalid.fetch_add(1, Ordering::Relaxed);
++            return;
++        }
++        let sequence = self.received.fetch_add(1, Ordering::Relaxed) + 1;
++        let Some(mut state) = self.try_state() else {
++            self.dropped.fetch_add(1, Ordering::Relaxed);
++            return;
++        };
++        if self.closed.load(Ordering::Acquire) {
++            return;
++        }
++        if state.depth == FRESH_AUDIO_CAPACITY {
++            state.head = (state.head + 1) % FRESH_AUDIO_CAPACITY;
++            state.depth -= 1;
++            self.dropped.fetch_add(1, Ordering::Relaxed);
++        }
++        let mut frame = FreshAudioFrame {
++            samples: [0; FRESH_AUDIO_SAMPLES],
++            decoded_at,
++            sequence,
++            discontinuity: false,
++        };
++        frame.samples.copy_from_slice(data);
++        let index = (state.head + state.depth) % FRESH_AUDIO_CAPACITY;
++        state.frames[index] = Some(frame);
++        state.depth += 1;
++        self.queued.store(state.depth as u64, Ordering::Relaxed);
++    }
++
++    fn take(&self, now: Instant, maximum_age: Duration) -> Option<FreshAudioFrame> {
++        if self.closed.load(Ordering::Acquire) {
++            return None;
++        }
++        let mut state = self.try_state()?;
++        for _ in 0..FRESH_AUDIO_CAPACITY {
++            if state.depth == 0 {
++                break;
++            }
++            let index = state.head;
++            let frame = state.frames[index].take();
++            state.head = (state.head + 1) % FRESH_AUDIO_CAPACITY;
++            state.depth -= 1;
++            self.queued.store(state.depth as u64, Ordering::Relaxed);
++            if let Some(mut frame) = frame {
++                if now < frame.decoded_at || now.duration_since(frame.decoded_at) > maximum_age {
++                    self.stale.fetch_add(1, Ordering::Relaxed);
++                    continue;
++                }
++                frame.discontinuity = frame.sequence != state.consumed_sequence + 1;
++                state.consumed_sequence = frame.sequence;
++                return Some(frame);
++            }
++        }
++        None
++    }
++
++    fn stats(&self) -> FreshAudioStats {
++        FreshAudioStats {
++            received: self.received.load(Ordering::Relaxed),
++            dropped: self.dropped.load(Ordering::Relaxed),
++            stale: self.stale.load(Ordering::Relaxed),
++            invalid: self.invalid.load(Ordering::Relaxed),
++            queued: if self.closed.load(Ordering::Acquire) {
++                0
++            } else {
++                self.queued.load(Ordering::Relaxed)
++            },
++        }
++    }
++}
++
++impl sys_at::AudioSink for FreshAudioQueue {
++    fn on_data(&self, data: &[i16], sample_rate: i32, channels: usize, frames: usize) {
++        self.on_data_with_age(data, sample_rate, channels, frames, 0);
++    }
++
++    fn on_data_with_age(
++        &self,
++        data: &[i16],
++        sample_rate: i32,
++        channels: usize,
++        frames: usize,
++        processing_age_us: u64,
++    ) {
++        // Translate elapsed time rather than assuming C++ and Rust Instant
++        // share an epoch. The native age includes format conversion/scheduling.
++        let Some(decoded_at) = Instant::now().checked_sub(Duration::from_micros(processing_age_us))
++        else {
++            self.invalid.fetch_add(1, Ordering::Relaxed);
++            return;
++        };
++        if sample_rate != 48_000 || channels != 2 || frames != 480 {
++            self.invalid.fetch_add(1, Ordering::Relaxed);
++            return;
++        }
++        self.push(data, decoded_at);
++    }
++}
++
++/// One track-bound native sink. Create/read/close on one owner; WebRTC owns the
++/// producer callback. Stop this stream before closing its Room/runtime.
++pub struct FreshAudioStream {
++    sink: SharedPtr<sys_at::ffi::NativeAudioSink>,
++    track: RtcAudioTrack,
++    queue: Arc<FreshAudioQueue>,
++    closed: bool,
++}
++
++impl FreshAudioStream {
++    /// Attach one converted 48 kHz stereo native sink to the audio track.
++    pub fn new(track: RtcAudioTrack) -> Self {
++        let queue = Arc::new(FreshAudioQueue::new());
++        let sink = sys_at::ffi::new_native_audio_sink(
++            Box::new(sys_at::AudioSinkWrapper::new(queue.clone())),
++            48_000,
++            2,
++        );
++        // SAFETY: RtcAudioTrack guarantees that this handle is an audio track.
++        let audio = unsafe { sys_at::ffi::media_to_audio(track.sys_handle()) };
++        audio.add_sink(&sink);
++        Self { sink, track, queue, closed: false }
++    }
++
++    /// Copy one fresh frame without waiting; discard expired queued values.
++    pub fn try_read(&self, maximum_age: Duration) -> Option<FreshAudioFrame> {
++        self.queue.take(Instant::now(), maximum_age)
++    }
++
++    /// Snapshot counters without entering the PCM critical section.
++    pub fn stats(&self) -> FreshAudioStats {
++        self.queue.stats()
++    }
++
++    /// Retire ingress before removing the native sink; repeated close is safe.
++    pub fn close(&mut self) {
++        if self.closed {
++            return;
++        }
++        self.closed = true;
++        self.queue.closed.store(true, Ordering::Release);
++        // SAFETY: The retained typed track keeps its native audio handle live.
++        let audio = unsafe { sys_at::ffi::media_to_audio(self.track.sys_handle()) };
++        audio.remove_sink(&self.sink);
++    }
++}
++
++impl Drop for FreshAudioStream {
++    fn drop(&mut self) {
++        self.close();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn overrun_stale_and_retirement() {
++        let queue = FreshAudioQueue::new();
++        let now = Instant::now();
++        for index in 0..10 {
++            queue.push(&[index; FRESH_AUDIO_SAMPLES], now);
++        }
++        assert_eq!(queue.stats().queued, 4);
++        assert_eq!(queue.stats().dropped, 6);
++        let frame = queue.take(now, Duration::from_millis(60)).unwrap();
++        assert_eq!(frame.samples[0], 6);
++        assert!(frame.discontinuity);
++        assert!(queue.take(now + Duration::from_secs(1), Duration::from_millis(60)).is_none());
++        assert_eq!(queue.stats().stale, 3);
++        queue.closed.store(true, Ordering::Release);
++        queue.push(&[1; FRESH_AUDIO_SAMPLES], now);
++        assert_eq!(queue.stats().received, 10);
++        assert!(queue.take(now, Duration::from_secs(1)).is_none());
++    }
++
++    #[test]
++    fn callback_drops_on_contention_without_waiting() {
++        let queue = FreshAudioQueue::new();
++        let guard = queue.try_state().unwrap();
++        queue.push(&[1; FRESH_AUDIO_SAMPLES], Instant::now());
++        assert_eq!(queue.stats().dropped, 1);
++        assert!(queue.take(Instant::now(), Duration::from_millis(60)).is_none());
++        drop(guard);
++        queue.push(&[2; FRESH_AUDIO_SAMPLES], Instant::now());
++        assert!(queue.take(Instant::now(), Duration::from_millis(60)).unwrap().discontinuity);
++    }
++
++    #[test]
++    fn slow_native_callback_does_not_refresh_decoded_age() {
++        use sys_at::AudioSink;
++
++        let queue = FreshAudioQueue::new();
++        for _ in 0..100 {
++            // Inject the elapsed conversion/callback time supplied by the native
++            // bridge, independently of time spent waiting in the reader queue.
++            queue.on_data_with_age(&[1; FRESH_AUDIO_SAMPLES], 48_000, 2, 480, 250_000);
++            assert!(queue.take(Instant::now(), Duration::from_millis(60)).is_none());
++        }
++        assert_eq!(queue.stats().stale, 100);
++        assert_eq!(queue.stats().queued, 0);
++        queue.on_data_with_age(&[2; FRESH_AUDIO_SAMPLES], 48_000, 2, 480, 0);
++        let recovered = queue.take(Instant::now(), Duration::from_secs(1)).unwrap();
++        assert_eq!(recovered.samples[0], 2);
++        assert!(recovered.discontinuity);
++    }
++
++    #[test]
++    fn concurrent_frames_are_owned_and_ordered() {
++        let queue = Arc::new(FreshAudioQueue::new());
++        let done = Arc::new(AtomicBool::new(false));
++        let now = Instant::now();
++        let producer_queue = queue.clone();
++        let producer_done = done.clone();
++        let producer = std::thread::spawn(move || {
++            for sequence in 1..=100_000u64 {
++                producer_queue.push(&[(sequence % 30_000) as i16; FRESH_AUDIO_SAMPLES], now);
++            }
++            producer_done.store(true, Ordering::Release);
++        });
++        let mut last_sequence = 0;
++        let mut torn = false;
++        while !done.load(Ordering::Acquire) || queue.stats().queued != 0 {
++            if let Some(frame) = queue.take(now, Duration::from_secs(1)) {
++                torn |= frame.sequence <= last_sequence;
++                torn |=
++                    frame.samples.iter().any(|sample| *sample != (frame.sequence % 30_000) as i16);
++                last_sequence = frame.sequence;
++            } else {
++                std::thread::yield_now();
++            }
++        }
++        producer.join().unwrap();
++        assert!(!torn);
++        assert!(last_sequence != 0);
++        assert_eq!(queue.stats().received, 100_000);
++        assert_eq!(queue.stats().queued, 0);
++    }
++}
+diff --git a/libwebrtc/src/native/mod.rs b/libwebrtc/src/native/mod.rs
+index de56e334..f74a1788 100644
+--- a/libwebrtc/src/native/mod.rs
++++ b/libwebrtc/src/native/mod.rs
+@@ -24,6 +24,7 @@ pub mod data_channel;
+ #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+ pub mod desktop_capturer;
+ pub mod frame_cryptor;
++pub mod fresh_audio_stream;
+ pub mod ice_candidate;
+ pub mod media_stream;
+ pub mod media_stream_track;
 diff --git a/libwebrtc/src/native/rtp_transceiver.rs b/libwebrtc/src/native/rtp_transceiver.rs
 index 3bd4fb59..a6a089bc 100644
 --- a/libwebrtc/src/native/rtp_transceiver.rs
@@ -318,14 +751,135 @@ index 4922add5..281dcfc7 100644
          ];
  
          for (proto_backend, expected) in cases {
+diff --git a/livekit-ffi/src/fresh_audio.rs b/livekit-ffi/src/fresh_audio.rs
+new file mode 100644
+index 00000000..2d1f2010
+--- /dev/null
++++ b/livekit-ffi/src/fresh_audio.rs
+@@ -0,0 +1,114 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//! Private fixed-frame native ABI. The public C++ class owns these pointers;
++//! no per-frame protobuf allocation, asynchronous dispatch, or handle lookup.
++
++use livekit::webrtc::{
++    native::fresh_audio_stream::{FreshAudioStream, FRESH_AUDIO_SAMPLES},
++    prelude::MediaStreamTrack,
++};
++use std::{ffi::c_void, panic, ptr, time::Duration};
++
++use crate::{server::room::FfiTrack, FFI_SERVER};
++
++#[repr(C)]
++/// Private C ABI result containing frame age and bounded ingress counters.
++pub struct FreshAudioInfo {
++    sequence: u64,
++    age_us: u64,
++    received: u64,
++    dropped: u64,
++    stale: u64,
++    invalid: u64,
++    queued: u64,
++    discontinuity: u32,
++}
++
++/// Create a sink for a live audio track. Returns null for invalid/non-audio IDs.
++#[no_mangle]
++pub extern "C" fn livekit_ffi_fresh_audio_create(track_handle: u64) -> *mut c_void {
++    panic::catch_unwind(|| {
++        let Ok(track) = FFI_SERVER.retrieve_handle::<FfiTrack>(track_handle) else {
++            return ptr::null_mut();
++        };
++        let MediaStreamTrack::Audio(audio) = track.track.rtc_track() else {
++            return ptr::null_mut();
++        };
++        Box::into_raw(Box::new(FreshAudioStream::new(audio))).cast()
++    })
++    .unwrap_or(ptr::null_mut())
++}
++
++/// # Safety
++/// Handle is null or the exclusively owned live create result. Call once,
++/// after all reads, and before Room/SDK destruction. No concurrent calls.
++#[no_mangle]
++pub unsafe extern "C" fn livekit_ffi_fresh_audio_destroy(handle: *mut c_void) {
++    if !handle.is_null() {
++        // SAFETY: The public owner returns exclusive ownership once.
++        drop(unsafe { Box::from_raw(handle.cast::<FreshAudioStream>()) });
++    }
++}
++
++/// Return 1 for a frame, 0 for empty/contention/stale, -1 for invalid arguments.
++/// Stats are returned even when the queue is empty; PCM is untouched then.
++///
++/// # Safety
++/// Handle is a live create result. Samples is a writable array of exactly 960
++/// i16, info is a writable FreshAudioInfo; both are aligned and do not alias the
++/// handle or each other. One owner serializes reads/destruction.
++#[no_mangle]
++pub unsafe extern "C" fn livekit_ffi_fresh_audio_read(
++    handle: *mut c_void,
++    samples: *mut i16,
++    sample_count: usize,
++    maximum_age_us: u64,
++    info: *mut FreshAudioInfo,
++) -> i32 {
++    if handle.is_null()
++        || samples.is_null()
++        || info.is_null()
++        || sample_count != FRESH_AUDIO_SAMPLES
++        || maximum_age_us == 0
++        || maximum_age_us > 1_000_000
++    {
++        return -1;
++    }
++    // SAFETY: All pointers follow the documented exclusive storage contract.
++    let stream = unsafe { &*handle.cast::<FreshAudioStream>() };
++    let frame = stream.try_read(Duration::from_micros(maximum_age_us));
++    let stats = stream.stats();
++    // SAFETY: The caller supplies exclusive writable, aligned result storage.
++    let output = unsafe { &mut *info };
++    *output = FreshAudioInfo {
++        sequence: 0,
++        age_us: 0,
++        received: stats.received,
++        dropped: stats.dropped,
++        stale: stats.stale,
++        invalid: stats.invalid,
++        queued: stats.queued,
++        discontinuity: 0,
++    };
++    if let Some(frame) = frame {
++        output.sequence = frame.sequence;
++        output.age_us = frame.decoded_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
++        output.discontinuity = u32::from(frame.discontinuity);
++        // SAFETY: The stack frame and caller's 960-sample output do not overlap.
++        unsafe { ptr::copy_nonoverlapping(frame.samples.as_ptr(), samples, FRESH_AUDIO_SAMPLES) };
++        return 1;
++    }
++    0
++}
 diff --git a/livekit-ffi/src/lib.rs b/livekit-ffi/src/lib.rs
-index 06695660..9c71e3fd 100644
+index 06695660..87cd8850 100644
 --- a/livekit-ffi/src/lib.rs
 +++ b/livekit-ffi/src/lib.rs
-@@ -19,6 +19,7 @@ use livekit::prelude::*;
+@@ -19,6 +19,8 @@ use livekit::prelude::*;
  use thiserror::Error;
  
  mod conversion;
++mod fresh_audio;
 +mod realtime_apm;
  
  pub mod cabi;
@@ -679,7 +1233,7 @@ index b02d88e5..c00819f8 100644
                      == inner.local_participant.identity().as_str()
                  {
 diff --git a/livekit/src/rtc_engine/peer_transport.rs b/livekit/src/rtc_engine/peer_transport.rs
-index 7eccd2ef..bff336e5 100644
+index 7eccd2ef..0e41446d 100644
 --- a/livekit/src/rtc_engine/peer_transport.rs
 +++ b/livekit/src/rtc_engine/peer_transport.rs
 @@ -33,6 +33,7 @@ struct TransportInner {
@@ -799,7 +1353,7 @@ index 7eccd2ef..bff336e5 100644
      pub async fn create_and_send_offer(&self, options: OfferOptions) -> EngineResult<()> {
          let mut inner = self.inner.lock().await;
          if options.ice_restart {
-@@ -478,6 +532,21 @@ impl PeerTransport {
+@@ -478,6 +532,14 @@ impl PeerTransport {
  
          let mut offer = self.peer_connection.create_offer(options).await?;
          let mut sdp = offer.to_string();
@@ -811,17 +1365,10 @@ index 7eccd2ef..bff336e5 100644
 +                Some((transceiver.mid()?, transceiver.sender().track()?.id()))
 +            })
 +            .collect();
-+        let current_ids = Self::munge_sender_track_ids(&sdp, &tracks);
-+        if current_ids != sdp {
-+            offer = SessionDescription::parse(&current_ids, offer.sdp_type()).map_err(|error| {
-+                super::EngineError::Internal(format!("Invalid current-track SDP: {error}").into())
-+            })?;
-+            sdp = current_ids;
-+        }
  
          if inner.single_pc_mode {
              // Fix inactive media m-lines to recvonly for single PC mode.
-@@ -511,14 +580,18 @@ impl PeerTransport {
+@@ -511,14 +573,18 @@ impl PeerTransport {
          }
  
          // Apply x-google-start-bitrate for all video codecs to improve initial quality.
@@ -842,10 +1389,104 @@ index 7eccd2ef..bff336e5 100644
                  log::info!(
                      "Applying x-google-start-bitrate={} kbps (target_bps={:?})",
                      start_kbps,
-@@ -552,8 +625,24 @@ impl PeerTransport {
+@@ -542,6 +608,16 @@ impl PeerTransport {
+ 
+         self.peer_connection.set_local_description(offer.clone()).await?;
+ 
++        // Keep libwebrtc's immutable sender identity in its local description.
++        // The SFU's AddTrack identity belongs only to the signalled offer.
++        let local_sdp = offer.to_string();
++        let current_ids = Self::munge_sender_track_ids(&local_sdp, &tracks);
++        if current_ids != local_sdp {
++            offer = SessionDescription::parse(&current_ids, offer.sdp_type()).map_err(|error| {
++                super::EngineError::Internal(format!("Invalid current-track SDP: {error}").into())
++            })?;
++        }
++
+         if let Some(handler) = self.on_offer_handler.lock().as_mut() {
+             handler(offer);
+         }
+@@ -552,8 +628,101 @@ impl PeerTransport {
  
  #[cfg(test)]
  mod tests {
++    #[cfg(not(target_arch = "wasm32"))]
++    #[tokio::test]
++    async fn reused_sender_keeps_local_identity_across_later_offers() {
++        use libwebrtc::{
++            audio_source::native::NativeAudioSource,
++            peer_connection_factory::native::PeerConnectionFactoryExt, prelude::*,
++        };
++        use parking_lot::Mutex;
++        use std::sync::Arc;
++
++        let factory = PeerConnectionFactory::default();
++        let publisher = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
++        let receiver = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
++        let source = NativeAudioSource::new(Default::default(), 48_000, 1, 10);
++        let original = factory.create_audio_track("original-sender", source.clone());
++        let replacement = factory.create_audio_track("replacement-track", source);
++        let transceiver = publisher
++            .add_transceiver(
++                MediaStreamTrack::Audio(original),
++                RtpTransceiverInit {
++                    direction: RtpTransceiverDirection::SendOnly,
++                    stream_ids: Vec::new(),
++                    send_encodings: Vec::new(),
++                },
++            )
++            .unwrap();
++        let transport =
++            PeerTransport::new(publisher.clone(), livekit_protocol::SignalTarget::Publisher, false);
++        let emitted = Arc::new(Mutex::new(None));
++        let output = emitted.clone();
++        transport.on_offer(Some(Box::new(move |offer| *output.lock() = Some(offer))));
++        let mut data_channel = None;
++        for phase in 0..3 {
++            if phase == 1 {
++                publisher.remove_track(transceiver.sender()).unwrap();
++                transceiver
++                    .sender()
++                    .set_track(Some(MediaStreamTrack::Audio(replacement.clone())))
++                    .unwrap();
++                transceiver.set_direction(RtpTransceiverDirection::SendOnly).unwrap();
++            }
++            if phase == 2 {
++                // An unrelated subsequent negotiation exposed the regression:
++                // a replacement initially worked, then disappeared remotely.
++                data_channel =
++                    Some(publisher.create_data_channel("unrelated", Default::default()).unwrap());
++            }
++            tokio::time::timeout(std::time::Duration::from_secs(10), async {
++                transport.create_and_send_offer(OfferOptions::default()).await.unwrap();
++                let offer = emitted.lock().take().expect("signalled offer");
++                let expected = if phase == 0 { "original-sender" } else { "replacement-track" };
++                assert!(offer
++                    .to_string()
++                    .lines()
++                    .any(|line| line.starts_with("a=msid:") && line.ends_with(expected)));
++                receiver.set_remote_description(offer).await.unwrap();
++                let answer = receiver.create_answer(AnswerOptions::default()).await.unwrap();
++                receiver.set_local_description(answer.clone()).await.unwrap();
++                transport.set_remote_description(answer).await.unwrap();
++                let local = publisher.current_local_description().unwrap().to_string();
++                assert!(local
++                    .lines()
++                    .any(|line| line.starts_with("a=msid:") && line.ends_with("original-sender")));
++                assert_eq!(
++                    publisher.transceivers().len(),
++                    1,
++                    "replacement grew the RTP transceiver set"
++                );
++            })
++            .await
++            .expect("offer/answer deadline");
++        }
++        drop(data_channel);
++        publisher.close();
++        receiver.close();
++    }
++
 +    #[test]
 +    fn reused_sender_msid_follows_current_track_and_preserves_receiver() {
 +        let original = "v=0\r\nm=video 9 RTP/AVP 96\r\na=mid:8\r\na=msid:- old\r\na=ssrc:123 msid:- old\r\na=ssrc:124 msid:screen old\r\nm=audio 9 RTP/AVP 111\r\na=mid:9\r\na=msid:remote receiver\r\n";
@@ -1652,6 +2293,102 @@ index 21337794..042ee055 100644
  
  static std::shared_ptr<MediaStreamTrack> video_to_media(
      std::shared_ptr<VideoTrack> track) {
+diff --git a/webrtc-sys/src/audio_track.cpp b/webrtc-sys/src/audio_track.cpp
+index 1738515f..e4f2c5ef 100644
+--- a/webrtc-sys/src/audio_track.cpp
++++ b/webrtc-sys/src/audio_track.cpp
+@@ -17,6 +17,7 @@
+ #include "livekit/audio_track.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <iostream>
+ #include <iterator>
+ #include <memory>
+@@ -95,6 +96,11 @@ void NativeAudioSink::OnData(const void* audio_data,
+                              int sample_rate,
+                              size_t number_of_channels,
+                              size_t number_of_frames) {
++  const auto decoded_at = std::chrono::steady_clock::now();
++  const auto processing_age_us = [&] {
++    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now() - decoded_at).count());
++  };
+   RTC_CHECK_EQ(16, bits_per_sample);
+ 
+   const int16_t* data = static_cast<const int16_t*>(audio_data);
+@@ -110,14 +116,14 @@ void NativeAudioSink::OnData(const void* audio_data,
+         frame_.data(), frame_.num_channels() * frame_.samples_per_channel());
+ 
+     observer_->on_data(rust_slice, frame_.sample_rate_hz(),
+-                       frame_.num_channels(), frame_.samples_per_channel());
++                       frame_.num_channels(), frame_.samples_per_channel(), processing_age_us());
+ 
+   } else {
+     rust::Slice<const int16_t> rust_slice(
+         data, number_of_channels * number_of_frames);
+ 
+     observer_->on_data(rust_slice, sample_rate, number_of_channels,
+-                       number_of_frames);
++                       number_of_frames, processing_age_us());
+   }
+ }
+ 
+diff --git a/webrtc-sys/src/audio_track.rs b/webrtc-sys/src/audio_track.rs
+index 67ed2701..23a3979d 100644
+--- a/webrtc-sys/src/audio_track.rs
++++ b/webrtc-sys/src/audio_track.rs
+@@ -86,6 +86,7 @@ pub mod ffi {
+             sample_rate: i32,
+             nb_channels: usize,
+             nb_frames: usize,
++            processing_age_us: u64,
+         );
+     }
+ }
+@@ -107,6 +108,19 @@ unsafe impl ExternType for CompleteCallback {
+ 
+ pub trait AudioSink: Send {
+     fn on_data(&self, data: &[i16], sample_rate: i32, nb_channels: usize, nb_frames: usize);
++
++    /// Receive PCM with elapsed time since native decoded ingress, including
++    /// format conversion. Existing observers may ignore this added metadata.
++    fn on_data_with_age(
++        &self,
++        data: &[i16],
++        sample_rate: i32,
++        nb_channels: usize,
++        nb_frames: usize,
++        _processing_age_us: u64,
++    ) {
++        self.on_data(data, sample_rate, nb_channels, nb_frames);
++    }
+ }
+ 
+ pub struct AudioSinkWrapper {
+@@ -118,7 +132,20 @@ impl AudioSinkWrapper {
+         Self { observer }
+     }
+ 
+-    fn on_data(&self, data: &[i16], sample_rate: i32, nb_channels: usize, nb_frames: usize) {
+-        self.observer.on_data(data, sample_rate, nb_channels, nb_frames);
++    fn on_data(
++        &self,
++        data: &[i16],
++        sample_rate: i32,
++        nb_channels: usize,
++        nb_frames: usize,
++        processing_age_us: u64,
++    ) {
++        self.observer.on_data_with_age(
++            data,
++            sample_rate,
++            nb_channels,
++            nb_frames,
++            processing_age_us,
++        );
+     }
+ }
 diff --git a/webrtc-sys/src/passthrough_video_encoder.cpp b/webrtc-sys/src/passthrough_video_encoder.cpp
 index cd45b9e3..9d50e638 100644
 --- a/webrtc-sys/src/passthrough_video_encoder.cpp

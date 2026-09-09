@@ -742,7 +742,7 @@ void Room::onEvent(const FfiEvent& event) {
             }
             // Attach to publication, mark subscribed
             rpublication->setTrack(remote_track);
-            rpublication->setSubscribed(true);
+            rpublication->updateSubscriptionState(true);
           }
 
           // Emit remote track_subscribed-style callback
@@ -787,7 +787,7 @@ void Room::onEvent(const FfiEvent& event) {
             unsub_source = publication->source();
             auto track = publication->track();
             publication->setTrack(nullptr);
-            publication->setSubscribed(false);
+            publication->updateSubscriptionState(false);
             ev.participant = rparticipant;
             ev.publication = publication;
             ev.track = track;

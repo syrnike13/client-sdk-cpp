@@ -96,6 +96,12 @@ public:
   bool setVideoDimensions(const std::uint32_t width, const std::uint32_t height);
 
 private:
+  friend class Room;
+
+  // Room events report observed state. Sending a subscription request from an
+  // event would let an old completion overwrite newer application intent.
+  void updateSubscriptionState(bool subscribed) noexcept { subscribed_ = subscribed; }
+
   enum class VideoPreference {
     DEFAULT,
     DIMENSIONS,

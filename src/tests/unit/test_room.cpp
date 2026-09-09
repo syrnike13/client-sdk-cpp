@@ -93,6 +93,25 @@ public:
   DisconnectReason reason = DisconnectReason::Unknown;
 };
 
+class UnitSubscriptionTrackingDelegate : public RoomDelegate {
+public:
+  void onTrackSubscribed(Room&, const TrackSubscribedEvent& event) override {
+    EXPECT_TRUE(event.publication->subscribed());
+    EXPECT_EQ(event.publication->track(), event.track);
+    ++subscribed;
+  }
+
+  void onTrackUnsubscribed(Room&, const TrackUnsubscribedEvent& event) override {
+    EXPECT_FALSE(event.publication->subscribed());
+    EXPECT_EQ(event.publication->track(), nullptr);
+    EXPECT_NE(event.track, nullptr);
+    ++unsubscribed;
+  }
+
+  unsigned subscribed{0};
+  unsigned unsubscribed{0};
+};
+
 } // namespace
 
 TEST_F(RoomTest, PublicationSnapshotBoundsAndRetainsRemovedHandles) {
@@ -455,6 +474,59 @@ TEST_F(RoomTest, DisconnectAfterServerDisconnectCleansUpWithoutDuplicateNotifica
   EXPECT_FALSE(RoomTestAccess::hasRoomHandle(room));
   EXPECT_EQ(RoomTestAccess::listenerId(room), 0);
   EXPECT_EQ(delegate.callbacks.size(), 1) << "onDisconnected must not fire twice";
+}
+
+TEST_F(RoomTest, SubscriptionEventsUpdateStateWithoutSendingSubscriptionRequests) {
+  Room room;
+  UnitSubscriptionTrackingDelegate delegate;
+  std::atomic<int> listener_calls{0};
+  room.setDelegate(&delegate);
+  RoomTestAccess::installConnectedListener(room, listener_calls);
+
+  auto participant = std::make_shared<RemoteParticipant>(FfiHandle{}, "participant-sid", "name", "remote", "",
+                                                         std::unordered_map<std::string, std::string>{},
+                                                         ParticipantKind::Standard, DisconnectReason::Unknown);
+  proto::OwnedTrackPublication owned;
+  owned.mutable_info()->set_sid("video");
+  owned.mutable_info()->set_kind(proto::TrackKind::KIND_VIDEO);
+  participant->mutableTrackPublications().emplace("video", std::make_shared<RemoteTrackPublication>(owned));
+  RoomTestAccess::setRemoteParticipant(room, participant);
+
+  // A zero FFI handle makes any outbound subscription request throw. Event
+  // delivery must only record the observed state and notify the delegate;
+  // reissuing a request here can overwrite a newer application intent.
+  proto::FfiEvent subscribed_event;
+  subscribed_event.mutable_room_event()->set_room_handle(0);
+  auto* subscribed = subscribed_event.mutable_room_event()->mutable_track_subscribed();
+  subscribed->set_participant_identity("remote");
+  subscribed->mutable_track()->mutable_handle()->set_id(0);
+  subscribed->mutable_track()->mutable_info()->set_sid("video");
+  subscribed->mutable_track()->mutable_info()->set_name("video");
+  subscribed->mutable_track()->mutable_info()->set_kind(proto::TrackKind::KIND_VIDEO);
+  subscribed->mutable_track()->mutable_info()->set_stream_state(proto::StreamState::STATE_ACTIVE);
+  subscribed->mutable_track()->mutable_info()->set_muted(false);
+  subscribed->mutable_track()->mutable_info()->set_remote(true);
+
+  proto::FfiEvent unsubscribed_event;
+  unsubscribed_event.mutable_room_event()->set_room_handle(0);
+  auto* unsubscribed = unsubscribed_event.mutable_room_event()->mutable_track_unsubscribed();
+  unsubscribed->set_participant_identity("remote");
+  unsubscribed->set_track_sid("video");
+
+  for (unsigned iteration = 0; iteration < 100; ++iteration) {
+    emitFfiEvent(subscribed_event);
+    EXPECT_EQ(delegate.subscribed, iteration + 1);
+    emitFfiEvent(unsubscribed_event);
+    EXPECT_EQ(delegate.unsubscribed, iteration + 1);
+    if (delegate.subscribed != iteration + 1 || delegate.unsubscribed != iteration + 1) {
+      break;
+    }
+  }
+
+  proto::FfiEvent eos_event;
+  eos_event.mutable_room_event()->set_room_handle(0);
+  eos_event.mutable_room_event()->mutable_eos();
+  emitFfiEvent(eos_event);
 }
 
 } // namespace livekit::test

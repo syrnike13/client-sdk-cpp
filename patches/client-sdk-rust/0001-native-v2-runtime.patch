@@ -122,6 +122,36 @@ index 00000000..5896d522
 +replacement screen track. Return an absent track safely for inactive senders.
 +This preserves bounded transceiver reuse while allowing the SFU to associate
 +new RTP media with the replacement publication.
+diff --git a/.changeset/stereo-playout-delay.md b/.changeset/stereo-playout-delay.md
+new file mode 100644
+index 00000000..83864652
+--- /dev/null
++++ b/.changeset/stereo-playout-delay.md
+@@ -0,0 +1,8 @@
++---
++libwebrtc: patch
++livekit: patch
++livekit-ffi: patch
++webrtc-sys: patch
++---
++
++Add a `stereo` publish option (TF_STEREO); `livekit_ffi_set_audio_playout_delay`, reported by the synthetic audio device as its playout delay; and synchronous capture for unbuffered audio sources (`CaptureAudioFrameRequest.synchronous`, `NativeAudioSource::capture_frame_direct`).
+diff --git a/libwebrtc/src/audio_source.rs b/libwebrtc/src/audio_source.rs
+index aadf7e63..0b0afa48 100644
+--- a/libwebrtc/src/audio_source.rs
++++ b/libwebrtc/src/audio_source.rs
+@@ -195,6 +195,11 @@ pub mod native {
+             self.handle.capture_frame(frame).await
+         }
+ 
++        /// Unbuffered sources: delivers one 10 ms frame in the calling thread.
++        pub fn capture_frame_direct(&self, frame: &AudioFrame<'_>) -> Result<(), RtcError> {
++            self.handle.capture_frame_direct(frame)
++        }
++
+         pub fn set_audio_options(&self, options: AudioSourceOptions) {
+             self.handle.set_audio_options(options)
+         }
 diff --git a/libwebrtc/src/lib.rs b/libwebrtc/src/lib.rs
 index 97611978..ee40bf25 100644
 --- a/libwebrtc/src/lib.rs
@@ -179,6 +209,135 @@ index a5c53fb9..f40b204d 100644
      pub fn new(
          echo_canceller_enabled: bool,
          gain_controller_enabled: bool,
+diff --git a/libwebrtc/src/native/audio_source.rs b/libwebrtc/src/native/audio_source.rs
+index 6b0d8893..70167e97 100644
+--- a/libwebrtc/src/native/audio_source.rs
++++ b/libwebrtc/src/native/audio_source.rs
+@@ -89,62 +89,81 @@ impl NativeAudioSource {
+         self.sys_handle.clear_buffer();
+     }
+ 
+-    pub async fn capture_frame(&self, frame: &AudioFrame<'_>) -> Result<(), RtcError> {
++    /// Delivers one 10 ms frame to WebRTC in the calling thread. Unbuffered
++    /// sources only: no runtime task or completion callback is involved, so
++    /// a busy async runtime cannot delay a realtime capture thread.
++    pub fn capture_frame_direct(&self, frame: &AudioFrame<'_>) -> Result<(), RtcError> {
+         if self.sample_rate != frame.sample_rate || self.num_channels != frame.num_channels {
+             return Err(RtcError {
+                 error_type: RtcErrorType::InvalidState,
+                 message: "sample_rate and num_channels don't match".to_owned(),
+             });
+         }
++        if self.queue_size_samples != 0 {
++            return Err(RtcError {
++                error_type: RtcErrorType::InvalidState,
++                message: "direct capture requires an unbuffered source".to_owned(),
++            });
++        }
++        // frame size must be 10ms for fast path
++        let expected_frames_per_ch = (self.sample_rate / 100) as usize;
++        if frame.data.len() % (self.num_channels as usize) != 0 {
++            return Err(RtcError {
++                error_type: RtcErrorType::InvalidState,
++                message: "frame.data length not divisible by channel count".to_owned(),
++            });
++        }
++        let nb_frames = frame.data.len() / (self.num_channels as usize);
++        if nb_frames != expected_frames_per_ch {
++            return Err(RtcError {
++                error_type: RtcErrorType::InvalidState,
++                message: format!(
++                    "direct capture requires 10ms frames: got {} frames, expected {}",
++                    nb_frames, expected_frames_per_ch
++                ),
++            });
++        }
+ 
+-        // Fast path: no buffering
+-        if self.queue_size_samples == 0 {
+-            // frame size must be 10ms for fast path
+-            let expected_frames_per_ch = (self.sample_rate / 100) as usize;
+-            if frame.data.len() % (self.num_channels as usize) != 0 {
+-                return Err(RtcError {
+-                    error_type: RtcErrorType::InvalidState,
+-                    message: "frame.data length not divisible by channel count".to_owned(),
+-                });
+-            }
+-            let nb_frames = frame.data.len() / (self.num_channels as usize);
+-            if nb_frames != expected_frames_per_ch {
++        // Define a no-op callback for fast path (queue_size_ms=0)
++        // This is safer than passing null, which can cause UB in release mode optimizations
++        extern "C" fn noop_complete_callback(_ctx: *const sys_at::SourceContext) {
++            // No-op: fast path completes synchronously, no callback needed
++        }
++
++        unsafe {
++            let data: &[i16] = frame.data.as_ref();
++            // Use a valid no-op callback instead of null for safety
++            // In release mode, transmuting null pointers can cause UB
++            let noop_callback = sys_at::CompleteCallback(noop_complete_callback);
++            let ok = self.sys_handle.capture_frame(
++                data,
++                self.sample_rate,
++                self.num_channels,
++                nb_frames,
++                std::ptr::null(), // Context is still null - callback won't use it
++                noop_callback,
++            );
++            if !ok {
+                 return Err(RtcError {
+                     error_type: RtcErrorType::InvalidState,
+-                    message: format!(
+-                        "direct capture requires 10ms frames: got {} frames, expected {}",
+-                        nb_frames, expected_frames_per_ch
+-                    ),
++                    message: "failed to capture frame without buffering".to_owned(),
+                 });
+             }
++        }
++        Ok(())
++    }
+ 
+-            // Define a no-op callback for fast path (queue_size_ms=0)
+-            // This is safer than passing null, which can cause UB in release mode optimizations
+-            extern "C" fn noop_complete_callback(_ctx: *const sys_at::SourceContext) {
+-                // No-op: fast path completes synchronously, no callback needed
+-            }
++    pub async fn capture_frame(&self, frame: &AudioFrame<'_>) -> Result<(), RtcError> {
++        if self.sample_rate != frame.sample_rate || self.num_channels != frame.num_channels {
++            return Err(RtcError {
++                error_type: RtcErrorType::InvalidState,
++                message: "sample_rate and num_channels don't match".to_owned(),
++            });
++        }
+ 
+-            unsafe {
+-                let data: &[i16] = frame.data.as_ref();
+-                // Use a valid no-op callback instead of null for safety
+-                // In release mode, transmuting null pointers can cause UB
+-                let noop_callback = sys_at::CompleteCallback(noop_complete_callback);
+-                let ok = self.sys_handle.capture_frame(
+-                    data,
+-                    self.sample_rate,
+-                    self.num_channels,
+-                    nb_frames,
+-                    std::ptr::null(), // Context is still null - callback won't use it
+-                    noop_callback,
+-                );
+-                if !ok {
+-                    return Err(RtcError {
+-                        error_type: RtcErrorType::InvalidState,
+-                        message: "failed to capture frame without buffering".to_owned(),
+-                    });
+-                }
+-            }
+-            return Ok(());
++        // Fast path: no buffering
++        if self.queue_size_samples == 0 {
++            return self.capture_frame_direct(frame);
+         }
+ 
+         // Buffered path.
 diff --git a/libwebrtc/src/native/fresh_audio_stream.rs b/libwebrtc/src/native/fresh_audio_stream.rs
 new file mode 100644
 index 00000000..5d90f21d
@@ -672,18 +831,39 @@ index 7a4234e3..880e2825 100644
  
      pub trait VideoFrameBufferExt: VideoBuffer {
 diff --git a/livekit-ffi/include/livekit_ffi.h b/livekit-ffi/include/livekit_ffi.h
-index 15f64dfa..025438bc 100644
+index 15f64dfa..bf31c631 100644
 --- a/livekit-ffi/include/livekit_ffi.h
 +++ b/livekit-ffi/include/livekit_ffi.h
-@@ -37,6 +37,8 @@ FfiHandleId livekit_ffi_request(const uint8_t *data, size_t len,
+@@ -37,6 +37,15 @@ FfiHandleId livekit_ffi_request(const uint8_t *data, size_t len,
  
  bool livekit_ffi_drop_handle(FfiHandleId handle_id);
  
 +void livekit_ffi_set_external_video_decoder(const void *decoder);
 +
++/**
++ * Delay of remote audio rendered by the application after the SDK hands it
++ * over (its buffers and output device). WebRTC's audio/video synchronization
++ * subtracts it from the audio playout position. Clamped to 1000 ms.
++ */
++void livekit_ffi_set_audio_playout_delay(uint32_t delay_ms);
++
  } // extern "C"
  
  #endif // livekit_ffi
+diff --git a/livekit-ffi/protocol/audio_frame.proto b/livekit-ffi/protocol/audio_frame.proto
+index 35143902..69cd9424 100644
+--- a/livekit-ffi/protocol/audio_frame.proto
++++ b/livekit-ffi/protocol/audio_frame.proto
+@@ -91,6 +91,9 @@ message CaptureAudioFrameRequest {
+   required uint64 source_handle = 1;
+   required AudioFrameBufferInfo buffer = 2;
+   optional uint64 request_async_id = 3;
++  // Unbuffered (queue_size_ms = 0) sources only: deliver the frame in the
++  // calling thread. The response completes the capture; no callback follows.
++  optional bool synchronous = 4;
+ }
+ message CaptureAudioFrameResponse {
+   required uint64 async_id = 1;
 diff --git a/livekit-ffi/protocol/ffi.proto b/livekit-ffi/protocol/ffi.proto
 index 53ea782b..1d03c91c 100644
 --- a/livekit-ffi/protocol/ffi.proto
@@ -727,10 +907,19 @@ index 53ea782b..1d03c91c 100644
  }
  
 diff --git a/livekit-ffi/protocol/room.proto b/livekit-ffi/protocol/room.proto
-index df08ed5b..ab1068a5 100644
+index df08ed5b..b531af27 100644
 --- a/livekit-ffi/protocol/room.proto
 +++ b/livekit-ffi/protocol/room.proto
-@@ -335,6 +335,7 @@ enum VideoEncoderBackend {
+@@ -326,6 +326,8 @@ message TrackPublishOptions {
+   // Controls how the encoder trades off between resolution and framerate
+   // when bandwidth is constrained. Default is MAINTAIN_RESOLUTION.
+   optional DegradationPreference degradation_preference = 13;
++  // Encode a two-channel audio source as stereo Opus.
++  optional bool stereo = 14;
+ }
+ 
+ enum VideoEncoderBackend {
+@@ -335,6 +337,7 @@ enum VideoEncoderBackend {
    ENCODER_BACKEND_NVENC = 3;
    ENCODER_BACKEND_VAAPI = 4;
    ENCODER_BACKEND_VIDEOTOOLBOX = 5;
@@ -806,10 +995,10 @@ index a4b610e0..0e177673 100644
  
  message VideoSourceInfo {
 diff --git a/livekit-ffi/src/cabi.rs b/livekit-ffi/src/cabi.rs
-index d9e83f13..e8ab3b62 100644
+index d9e83f13..0ea4fa91 100644
 --- a/livekit-ffi/src/cabi.rs
 +++ b/livekit-ffi/src/cabi.rs
-@@ -108,6 +108,19 @@ pub extern "C" fn livekit_ffi_drop_handle(handle_id: FfiHandleId) -> bool {
+@@ -108,6 +108,27 @@ pub extern "C" fn livekit_ffi_drop_handle(handle_id: FfiHandleId) -> bool {
      FFI_SERVER.drop_handle(handle_id)
  }
  
@@ -826,11 +1015,19 @@ index d9e83f13..e8ab3b62 100644
 +    webrtc_sys::external_video_decoder::lk_set_external_video_decoder(decoder);
 +}
 +
++/// Delay of remote audio rendered by the application after the SDK hands it
++/// over (its buffers and output device). WebRTC's audio/video synchronization
++/// subtracts it from the audio playout position. Clamped to 1000 ms.
++#[no_mangle]
++pub extern "C" fn livekit_ffi_set_audio_playout_delay(delay_ms: u32) {
++    unsafe { webrtc_sys::playout_delay::lk_set_playout_delay_ms(delay_ms) }
++}
++
  #[no_mangle]
  pub extern "C" fn livekit_ffi_dispose() {
      FFI_SERVER.async_runtime.block_on(FFI_SERVER.dispose());
 diff --git a/livekit-ffi/src/conversion/room.rs b/livekit-ffi/src/conversion/room.rs
-index 4922add5..281dcfc7 100644
+index 4922add5..36763e4d 100644
 --- a/livekit-ffi/src/conversion/room.rs
 +++ b/livekit-ffi/src/conversion/room.rs
 @@ -63,6 +63,9 @@ fn video_encoder_from_proto(backend: Option<i32>) -> Option<VideoEncoderBackend>
@@ -843,7 +1040,32 @@ index 4922add5..281dcfc7 100644
      }
  }
  
-@@ -447,6 +450,7 @@ mod tests {
+@@ -366,6 +369,7 @@ impl From<proto::TrackPublishOptions> for TrackPublishOptions {
+                 .unwrap_or(default_publish_options.video_encoder),
+             scalability_mode: opts.scalability_mode,
+             degradation_preference: degradation_preference_from_proto(opts.degradation_preference),
++            stereo: opts.stereo.unwrap_or(default_publish_options.stereo),
+         }
+     }
+ }
+@@ -428,6 +432,16 @@ mod tests {
+         assert!(options.sdk_options.other_sdks.is_none());
+     }
+ 
++    #[test]
++    fn stereo_publish_option_round_trips() {
++        assert!(!TrackPublishOptions::from(proto::TrackPublishOptions::default()).stereo);
++        let options = TrackPublishOptions::from(proto::TrackPublishOptions {
++            stereo: Some(true),
++            ..Default::default()
++        });
++        assert!(options.stereo);
++    }
++
+     #[test]
+     fn video_encoder_defaults_to_auto() {
+         let options = TrackPublishOptions::from(proto::TrackPublishOptions::default());
+@@ -447,6 +461,7 @@ mod tests {
                  proto::VideoEncoderBackend::EncoderBackendVideotoolbox,
                  VideoEncoderBackend::VideoToolbox,
              ),
@@ -1106,6 +1328,39 @@ index 00000000..a13fa9f4
 +    }
 +    0
 +}
+diff --git a/livekit-ffi/src/server/audio_source.rs b/livekit-ffi/src/server/audio_source.rs
+index fd4f06cf..5c472e20 100644
+--- a/livekit-ffi/src/server/audio_source.rs
++++ b/livekit-ffi/src/server/audio_source.rs
+@@ -108,6 +108,28 @@ impl FfiAudioSource {
+         let source = self.source.clone();
+         let async_id = server.resolve_async_id(capture.request_async_id);
+ 
++        if capture.synchronous.unwrap_or(false) {
++            #[cfg(not(target_arch = "wasm32"))]
++            if let RtcAudioSource::Native(ref source) = source {
++                let data = unsafe {
++                    let len = buffer.num_channels * buffer.samples_per_channel;
++                    slice::from_raw_parts(buffer.data_ptr as *const i16, len as usize)
++                };
++                source
++                    .capture_frame_direct(&AudioFrame {
++                        data: Cow::Borrowed(data),
++                        sample_rate: buffer.sample_rate,
++                        num_channels: buffer.num_channels,
++                        samples_per_channel: buffer.samples_per_channel,
++                    })
++                    .map_err(|e| FfiError::InvalidRequest(e.to_string().into()))?;
++                return Ok(proto::CaptureAudioFrameResponse { async_id });
++            }
++            return Err(FfiError::InvalidRequest(
++                "synchronous capture needs a native source".into(),
++            ));
++        }
++
+         let data = unsafe {
+             let len = buffer.num_channels * buffer.samples_per_channel;
+             slice::from_raw_parts(buffer.data_ptr as *const i16, len as usize)
 diff --git a/livekit-ffi/src/server/colorcvt/cvtimpl.rs b/livekit-ffi/src/server/colorcvt/cvtimpl.rs
 index 95a52e26..cb63a157 100644
 --- a/livekit-ffi/src/server/colorcvt/cvtimpl.rs
@@ -1436,6 +1691,43 @@ index b02d88e5..c00819f8 100644
                  let participant = if participant_identity.as_str()
                      == inner.local_participant.identity().as_str()
                  {
+diff --git a/livekit/src/room/options.rs b/livekit/src/room/options.rs
+index f443f608..98a3228c 100644
+--- a/livekit/src/room/options.rs
++++ b/livekit/src/room/options.rs
+@@ -151,6 +151,9 @@ pub struct TrackPublishOptions {
+     /// - Screen share: `MaintainResolution` (clarity is critical for text/UI)
+     /// - Other/unknown: `Balanced`
+     pub degradation_preference: Option<DegradationPreference>,
++    /// Encode a two-channel audio source as stereo Opus. The server then
++    /// negotiates stereo with the publisher and its subscribers.
++    pub stereo: bool,
+ }
+ 
+ impl Default for TrackPublishOptions {
+@@ -170,6 +173,7 @@ impl Default for TrackPublishOptions {
+             video_encoder: VideoEncoderBackend::Auto,
+             scalability_mode: None,
+             degradation_preference: None,
++            stereo: false,
+         }
+     }
+ }
+diff --git a/livekit/src/room/participant/local_participant.rs b/livekit/src/room/participant/local_participant.rs
+index f01c754c..d83a61c8 100644
+--- a/livekit/src/room/participant/local_participant.rs
++++ b/livekit/src/room/participant/local_participant.rs
+@@ -398,6 +398,10 @@ impl LocalParticipant {
+         if options.preconnect_buffer {
+             req.audio_features.push(proto::AudioTrackFeature::TfPreconnectBuffer as i32);
+         }
++        if options.stereo && matches!(track, LocalTrack::Audio(_)) {
++            req.stereo = true;
++            req.audio_features.push(proto::AudioTrackFeature::TfStereo as i32);
++        }
+ 
+         req.packet_trailer_features =
+             options.frame_metadata_features.to_proto().into_iter().map(|f| f as i32).collect();
 diff --git a/livekit/src/rtc_engine/peer_transport.rs b/livekit/src/rtc_engine/peer_transport.rs
 index 7eccd2ef..0e41446d 100644
 --- a/livekit/src/rtc_engine/peer_transport.rs
@@ -2561,6 +2853,23 @@ index abf4f5ab..d49ab199 100644
  };
  
  std::shared_ptr<PeerConnectionFactory> create_peer_connection_factory();
+diff --git a/webrtc-sys/include/livekit/synthetic_audio_device.h b/webrtc-sys/include/livekit/synthetic_audio_device.h
+index 0d0bb8db..3b31e137 100644
+--- a/webrtc-sys/include/livekit/synthetic_audio_device.h
++++ b/webrtc-sys/include/livekit/synthetic_audio_device.h
+@@ -24,6 +24,12 @@
+ #include "rtc_base/synchronization/mutex.h"
+ #include "rtc_base/task_utils/repeating_task.h"
+ 
++// Delay of audio that the application renders after WebRTC hands it over
++// (its own buffers and output device). The synthetic device reports it as
++// PlayoutDelay, so audio/video synchronization and the playout estimates
++// account for it. Clamped to 1000 ms; process-wide.
++extern "C" void lk_set_playout_delay_ms(uint32_t delay_ms);
++
+ namespace livekit_ffi {
+ 
+ class SyntheticAudioDevice : public webrtc::AudioDeviceModule {
 diff --git a/webrtc-sys/include/livekit/video_frame_buffer.h b/webrtc-sys/include/livekit/video_frame_buffer.h
 index cb419fd3..4f09d876 100644
 --- a/webrtc-sys/include/livekit/video_frame_buffer.h
@@ -2894,10 +3203,10 @@ index 00000000..79dcb9c0
 +
 +}  // namespace livekit_ffi
 diff --git a/webrtc-sys/src/lib.rs b/webrtc-sys/src/lib.rs
-index d33322f1..3ef31583 100644
+index d33322f1..29af5e31 100644
 --- a/webrtc-sys/src/lib.rs
 +++ b/webrtc-sys/src/lib.rs
-@@ -43,6 +43,16 @@ pub mod video_track;
+@@ -43,6 +43,23 @@ pub mod video_track;
  pub mod webrtc;
  pub mod yuv_helper;
  
@@ -2908,6 +3217,13 @@ index d33322f1..3ef31583 100644
 +        /// `decoder` is null or a valid `LkExternalVideoDecoder` that outlives
 +        /// every decoder created after this call.
 +        pub fn lk_set_external_video_decoder(decoder: *const std::ffi::c_void);
++    }
++}
++
++/// Application playout delay, see `include/livekit/synthetic_audio_device.h`.
++pub mod playout_delay {
++    extern "C" {
++        pub fn lk_set_playout_delay_ms(delay_ms: u32);
 +    }
 +}
 +
@@ -3364,6 +3680,32 @@ index e97bed2d..24ae4db9 100644
  }
  
  uint32_t RtpSender::ssrc() const {
+diff --git a/webrtc-sys/src/synthetic_audio_device.cpp b/webrtc-sys/src/synthetic_audio_device.cpp
+index 8074b9d9..ec76aef1 100644
+--- a/webrtc-sys/src/synthetic_audio_device.cpp
++++ b/webrtc-sys/src/synthetic_audio_device.cpp
+@@ -288,7 +288,12 @@ int32_t SyntheticAudioDevice::StereoRecording(bool* enabled) const {
+   return 0;
+ }
+ 
++namespace {
++std::atomic<uint16_t> g_playout_delay_ms{0};
++}  // namespace
++
+ int32_t SyntheticAudioDevice::PlayoutDelay(uint16_t* delayMS) const {
++  *delayMS = g_playout_delay_ms.load(std::memory_order_relaxed);
+   return 0;
+ }
+ 
+@@ -333,3 +338,8 @@ int32_t SyntheticAudioDevice::SetObserver(webrtc::AudioDeviceObserver* observer)
+ }
+ 
+ }  // namespace livekit_ffi
++
++extern "C" void lk_set_playout_delay_ms(uint32_t delay_ms) {
++  livekit_ffi::g_playout_delay_ms.store(static_cast<uint16_t>(delay_ms > 1000 ? 1000 : delay_ms),
++                                        std::memory_order_relaxed);
++}
 diff --git a/webrtc-sys/src/video_decoder_factory.cpp b/webrtc-sys/src/video_decoder_factory.cpp
 index d22ae70d..676b8e5a 100644
 --- a/webrtc-sys/src/video_decoder_factory.cpp

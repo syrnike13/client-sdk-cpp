@@ -114,6 +114,19 @@ void AudioSource::captureFrame(const AudioFrame& frame, int timeout_ms) {
 
   // Build AudioFrameBufferInfo from the wrapper
   const proto::AudioFrameBufferInfo buf = frame.toProto();
+  if (queue_size_ms_ == 0) {
+    // Unbuffered: WebRTC consumes the frame in this thread. No runtime task
+    // or callback thread can delay a realtime capture thread under CPU load.
+    proto::FfiRequest req;
+    auto* msg = req.mutable_capture_audio_frame();
+    msg->set_source_handle(handle_.get());
+    msg->set_synchronous(true);
+    msg->mutable_buffer()->CopyFrom(buf);
+    if (!FfiClient::instance().sendRequest(req).has_capture_audio_frame()) {
+      throw std::runtime_error("AudioSource::captureFrame: FFI response missing capture result");
+    }
+    return;
+  }
   // Use async FFI API and block until the callback completes
   auto fut = FfiClient::instance().captureAudioFrameAsync(handle_.get(), buf);
   if (timeout_ms == 0) {

@@ -539,6 +539,9 @@ proto::TrackPublishOptions toProto(const TrackPublishOptions& in) {
   if (in.degradation_preference) {
     msg.set_degradation_preference(static_cast<proto::DegradationPreference>(*in.degradation_preference));
   }
+  if (in.stereo) {
+    msg.set_stereo(*in.stereo);
+  }
   return msg;
 }
 
@@ -581,6 +584,9 @@ TrackPublishOptions fromProto(const proto::TrackPublishOptions& in) {
   out.packet_trailer_features = frame_metadata_features;
   if (in.has_degradation_preference()) {
     out.degradation_preference = static_cast<DegradationPreference>(in.degradation_preference());
+  }
+  if (in.has_stereo()) {
+    out.stereo = in.stereo();
   }
   return out;
 }

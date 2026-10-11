@@ -152,6 +152,20 @@ TEST(TrackPublishOptionsTest, DegradationPreferenceRoundTrip) {
   EXPECT_EQ(*round_trip.degradation_preference, DegradationPreference::MaintainFramerateAndResolution);
 }
 
+TEST(TrackPublishOptionsTest, StereoRoundTrip) {
+  EXPECT_FALSE(toProto(TrackPublishOptions{}).has_stereo());
+
+  TrackPublishOptions options;
+  options.stereo = true;
+  const proto::TrackPublishOptions proto_options = toProto(options);
+  ASSERT_TRUE(proto_options.has_stereo());
+  EXPECT_TRUE(proto_options.stereo());
+
+  const TrackPublishOptions round_trip = fromProto(proto_options);
+  ASSERT_TRUE(round_trip.stereo.has_value());
+  EXPECT_TRUE(*round_trip.stereo);
+}
+
 TEST(TrackPublishOptionsTest, PreEncodedBackendRoundTrip) {
   TrackPublishOptions options;
   options.video_encoder = VideoEncoderBackend::PreEncoded;

@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -25,8 +26,9 @@
 
 namespace livekit {
 
-/// Mirror of WebRTC video buffer type
-enum class VideoBufferType { RGBA = 0, ABGR, ARGB, BGRA, RGB24, I420, I420A, I422, I444, I010, NV12 };
+/// Mirror of WebRTC video buffer type. External frames come from an
+/// application decoder (see setExternalVideoDecoder) and carry no pixels.
+enum class VideoBufferType { RGBA = 0, ABGR, ARGB, BGRA, RGB24, I420, I420A, I422, I444, I010, NV12, External };
 
 /// @brief Plane layout metadata for a VideoFrame buffer.
 struct VideoPlaneInfo {
@@ -68,6 +70,10 @@ public:
   std::uint8_t* data() noexcept { return data_.data(); }
   const std::uint8_t* data() const noexcept { return data_.data(); }
   std::size_t dataSize() const noexcept { return data_.size(); }
+
+  /// The decoder's frame for VideoBufferType::External, valid while this
+  /// VideoFrame lives; null otherwise.
+  void* externalFrame() const noexcept { return external_frame_; }
 
   /// Compute plane layout for this frame (Y/U/V, UV, etc.), in terms of
   /// pointers & sizes relative to this frame's backing buffer.
@@ -111,6 +117,8 @@ private:
   int height_;
   VideoBufferType type_;
   std::vector<std::uint8_t> data_;
+  void* external_frame_ = nullptr;
+  std::shared_ptr<void> external_owner_;
 };
 
 } // namespace livekit

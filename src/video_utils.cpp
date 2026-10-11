@@ -52,6 +52,8 @@ proto::VideoBufferType toProto(const VideoBufferType t) {
       return proto::VideoBufferType::I010;
     case VideoBufferType::NV12:
       return proto::VideoBufferType::NV12;
+    case VideoBufferType::External:
+      return proto::VideoBufferType::EXTERNAL;
     default:
       throw std::runtime_error("Unknown VideoBufferType in toProto");
   }
@@ -82,6 +84,8 @@ VideoBufferType fromProto(const proto::VideoBufferType t) {
       return VideoBufferType::I010;
     case proto::VideoBufferType::NV12:
       return VideoBufferType::NV12;
+    case proto::VideoBufferType::EXTERNAL:
+      return VideoBufferType::External;
     default:
       throw std::runtime_error("Unknown proto::VideoBufferType in fromProto");
   }

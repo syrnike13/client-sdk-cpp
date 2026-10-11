@@ -17,6 +17,7 @@
 #include "livekit/livekit.h"
 
 #include "ffi_client.h"
+#include "livekit_ffi.h"
 #include "lk_log.h"
 
 namespace livekit {
@@ -27,6 +28,10 @@ bool initialize(const LogLevel& level) {
   auto& ffi_client = FfiClient::instance();
   // Note: capture_logs currently disabled, requires event support in FfiClient
   return ffi_client.initialize(false);
+}
+
+void setExternalVideoDecoder(const LkExternalVideoDecoder* decoder) {
+  livekit_ffi_set_external_video_decoder(decoder);
 }
 
 bool isInitialized() { return FfiClient::instance().isInitialized(); }

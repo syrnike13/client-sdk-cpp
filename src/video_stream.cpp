@@ -139,6 +139,7 @@ void VideoStream::initFromTrack(const std::shared_ptr<Track>& track, const Optio
   new_video_stream->set_type(proto::VideoStreamType::VIDEO_STREAM_NATIVE);
   new_video_stream->set_normalize_stride(true);
   new_video_stream->set_format(toProto(options.format));
+  new_video_stream->set_external_frames(options.external_frames);
 
   auto resp = FfiClient::instance().sendRequest(req);
   if (!resp.has_new_video_stream()) {
@@ -166,6 +167,7 @@ void VideoStream::initFromParticipant(Participant& participant, TrackSource trac
   vs->set_track_source(static_cast<proto::TrackSource>(track_source));
   vs->set_normalize_stride(true);
   vs->set_format(toProto(options.format));
+  vs->set_external_frames(options.external_frames);
 
   auto resp = FfiClient::instance().sendRequest(req);
   // Adjust field names to match your proto exactly:

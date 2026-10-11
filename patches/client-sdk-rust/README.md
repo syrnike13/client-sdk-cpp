@@ -66,3 +66,13 @@ See [the deterministic socket-retirement reproduction](../../docs/ice-socket-ret
 
 The unsuccessful tag v1.10.0-syrnike.3 referenced the unpublished Rust commit
 and produced no release assets. v1.10.0-syrnike.4 is the reproducible successor.
+
+The v1.10.0-syrnike.16 candidate adds an application video decoder
+(`webrtc-sys/include/livekit/external_video_decoder.h`, exported as
+`livekit_ffi_set_external_video_decoder`). For H.264 the decoder factory puts
+it in front of the internal FFmpeg decoder through WebRTC's software fallback
+wrapper; declining a stream or returning `LK_EXTERNAL_DECODE_FALLBACK` keeps
+decoding in software. Its frames are native buffers carrying the application's
+frame; video streams created with `external_frames` deliver them as
+`VideoBufferType::EXTERNAL` without conversion, other streams read them back
+through `read_i420`.

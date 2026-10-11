@@ -586,6 +586,25 @@ index 3bd4fb59..a6a089bc 100644
      pub fn sender(&self) -> rtp_sender::RtpSender {
          rtp_sender::RtpSender { handle: RtpSender { sys_handle: self.sys_handle.sender() } }
      }
+diff --git a/libwebrtc/src/native/video_frame.rs b/libwebrtc/src/native/video_frame.rs
+index 1f9f62f5..59102793 100644
+--- a/libwebrtc/src/native/video_frame.rs
++++ b/libwebrtc/src/native/video_frame.rs
+@@ -161,6 +161,14 @@ impl NativeBuffer {
+         }
+     }
+ 
++    /// The application frame of an external decoder, if this buffer holds one.
++    pub fn external_frame(&self) -> Option<usize> {
++        match vfb_sys::ffi::native_buffer_external_frame(&self.sys_handle) {
++            0 => None,
++            frame => Some(frame),
++        }
++    }
++
+     #[cfg(any(target_os = "macos", target_os = "ios"))]
+     pub fn get_cv_pixel_buffer(&self) -> *mut std::ffi::c_void {
+         unsafe { vfb_sys::ffi::native_buffer_to_platform_image_buffer(&self.sys_handle) as *mut _ }
 diff --git a/libwebrtc/src/rtp_sender.rs b/libwebrtc/src/rtp_sender.rs
 index 1bdf96ad..ca60a36c 100644
 --- a/libwebrtc/src/rtp_sender.rs
@@ -635,6 +654,36 @@ index 00a7a919..b033b780 100644
      pub fn sender(&self) -> RtpSender {
          self.handle.sender()
      }
+diff --git a/libwebrtc/src/video_frame.rs b/libwebrtc/src/video_frame.rs
+index 7a4234e3..880e2825 100644
+--- a/libwebrtc/src/video_frame.rs
++++ b/libwebrtc/src/video_frame.rs
+@@ -590,6 +590,12 @@ pub mod native {
+         pub fn get_cv_pixel_buffer(&self) -> *mut std::ffi::c_void {
+             self.handle.get_cv_pixel_buffer()
+         }
++
++        /// The application frame when an external decoder produced this
++        /// buffer (see `lk_set_external_video_decoder`).
++        pub fn external_frame(&self) -> Option<usize> {
++            self.handle.external_frame()
++        }
+     }
+ 
+     pub trait VideoFrameBufferExt: VideoBuffer {
+diff --git a/livekit-ffi/include/livekit_ffi.h b/livekit-ffi/include/livekit_ffi.h
+index 15f64dfa..025438bc 100644
+--- a/livekit-ffi/include/livekit_ffi.h
++++ b/livekit-ffi/include/livekit_ffi.h
+@@ -37,6 +37,8 @@ FfiHandleId livekit_ffi_request(const uint8_t *data, size_t len,
+ 
+ bool livekit_ffi_drop_handle(FfiHandleId handle_id);
+ 
++void livekit_ffi_set_external_video_decoder(const void *decoder);
++
+ } // extern "C"
+ 
+ #endif // livekit_ffi
 diff --git a/livekit-ffi/protocol/ffi.proto b/livekit-ffi/protocol/ffi.proto
 index 53ea782b..1d03c91c 100644
 --- a/livekit-ffi/protocol/ffi.proto
@@ -690,10 +739,28 @@ index df08ed5b..ab1068a5 100644
  
  // Controls how the encoder degrades quality when bandwidth is constrained.
 diff --git a/livekit-ffi/protocol/video_frame.proto b/livekit-ffi/protocol/video_frame.proto
-index a4b610e0..82b60f0c 100644
+index a4b610e0..0e177673 100644
 --- a/livekit-ffi/protocol/video_frame.proto
 +++ b/livekit-ffi/protocol/video_frame.proto
-@@ -82,6 +82,27 @@ message CaptureVideoFrameRequest {
+@@ -37,6 +37,9 @@ message NewVideoStreamRequest {
+   // unbounded buffering, for only one of them can increase end-to-end latency
+   // for that stream and cause audio/video drift.
+   optional uint32 queue_size_frames = 5;
++  // Deliver frames of the application's external decoder as EXTERNAL buffers
++  // (the decoder's frame in data_ptr) instead of converting them to `format`.
++  optional bool external_frames = 6;
+ }
+ message NewVideoStreamResponse { required OwnedVideoStream stream = 1; }
+ 
+@@ -56,6 +59,7 @@ message VideoStreamFromParticipantRequest {
+   // unbounded buffering, for only one of them can increase end-to-end latency
+   // for that stream and cause audio/video drift.
+   optional uint32 queue_size_frames = 6;
++  optional bool external_frames = 7;
+ }
+ 
+ message VideoStreamFromParticipantResponse { required OwnedVideoStream stream = 1;}
+@@ -82,6 +86,27 @@ message CaptureVideoFrameRequest {
  
  message CaptureVideoFrameResponse {}
  
@@ -721,7 +788,16 @@ index a4b610e0..82b60f0c 100644
  message VideoConvertRequest {
    optional bool flip_y = 1;
    required VideoBufferInfo buffer = 2;
-@@ -207,6 +228,7 @@ message VideoSourceResolution {
+@@ -133,6 +158,8 @@ enum VideoBufferType {
+   I444 = 8;
+   I010 = 9;
+   NV12 = 10;
++  // Frame of the application's external decoder; carries no pixels.
++  EXTERNAL = 11;
+ }
+ 
+ message VideoBufferInfo {
+@@ -207,6 +234,7 @@ message VideoSourceResolution {
  
  enum VideoSourceType {
    VIDEO_SOURCE_NATIVE = 0;
@@ -729,6 +805,30 @@ index a4b610e0..82b60f0c 100644
  }
  
  message VideoSourceInfo {
+diff --git a/livekit-ffi/src/cabi.rs b/livekit-ffi/src/cabi.rs
+index d9e83f13..e8ab3b62 100644
+--- a/livekit-ffi/src/cabi.rs
++++ b/livekit-ffi/src/cabi.rs
+@@ -108,6 +108,19 @@ pub extern "C" fn livekit_ffi_drop_handle(handle_id: FfiHandleId) -> bool {
+     FFI_SERVER.drop_handle(handle_id)
+ }
+ 
++/// Installs the application's video decoder; null removes it. Decoders created
++/// afterwards use it, with WebRTC's own decoder as the fallback.
++///
++/// # Safety
++///
++/// `decoder` is null or points to an `LkExternalVideoDecoder` (see
++/// `webrtc-sys/include/livekit/external_video_decoder.h`) that outlives every
++/// video track subscribed after this call.
++#[no_mangle]
++pub unsafe extern "C" fn livekit_ffi_set_external_video_decoder(decoder: *const std::ffi::c_void) {
++    webrtc_sys::external_video_decoder::lk_set_external_video_decoder(decoder);
++}
++
+ #[no_mangle]
+ pub extern "C" fn livekit_ffi_dispose() {
+     FFI_SERVER.async_runtime.block_on(FFI_SERVER.dispose());
 diff --git a/livekit-ffi/src/conversion/room.rs b/livekit-ffi/src/conversion/room.rs
 index 4922add5..281dcfc7 100644
 --- a/livekit-ffi/src/conversion/room.rs
@@ -1006,6 +1106,36 @@ index 00000000..a13fa9f4
 +    }
 +    0
 +}
+diff --git a/livekit-ffi/src/server/colorcvt/cvtimpl.rs b/livekit-ffi/src/server/colorcvt/cvtimpl.rs
+index 95a52e26..cb63a157 100644
+--- a/livekit-ffi/src/server/colorcvt/cvtimpl.rs
++++ b/livekit-ffi/src/server/colorcvt/cvtimpl.rs
+@@ -34,6 +34,9 @@ pub unsafe fn cvt(
+         proto::VideoBufferType::I444 => cvt_i444(buffer, dst_type, flip_y),
+         proto::VideoBufferType::I010 => cvt_i010(buffer, dst_type, flip_y),
+         proto::VideoBufferType::Nv12 => cvt_nv12(buffer, dst_type, flip_y),
++        proto::VideoBufferType::External => {
++            Err(FfiError::InvalidRequest("external frames carry no pixels".into()))
++        }
+     }
+ }
+ 
+diff --git a/livekit-ffi/src/server/colorcvt/mod.rs b/livekit-ffi/src/server/colorcvt/mod.rs
+index bb1ca6fc..fbe9b165 100644
+--- a/livekit-ffi/src/server/colorcvt/mod.rs
++++ b/livekit-ffi/src/server/colorcvt/mod.rs
+@@ -119,6 +119,11 @@ pub unsafe fn to_libwebrtc_buffer(info: proto::VideoBufferInfo) -> BoxVideoBuffe
+             duv.copy_from_slice(data_uv);
+             Box::new(nv12) as BoxVideoBuffer
+         }
++        proto::VideoBufferType::External => {
++            // Decoder output only; it carries no pixels to capture.
++            log::error!("external frames cannot be captured");
++            Box::new(I420Buffer::new_black(width, height)) as BoxVideoBuffer
++        }
+     }
+ }
+ 
 diff --git a/livekit-ffi/src/server/requests.rs b/livekit-ffi/src/server/requests.rs
 index 8ee56988..95f1c87c 100644
 --- a/livekit-ffi/src/server/requests.rs
@@ -1167,6 +1297,80 @@ index ee1410a7..1b280e2d 100644
  }
  
  #[cfg(test)]
+diff --git a/livekit-ffi/src/server/video_stream.rs b/livekit-ffi/src/server/video_stream.rs
+index 2cc69ae7..f1697d29 100644
+--- a/livekit-ffi/src/server/video_stream.rs
++++ b/livekit-ffi/src/server/video_stream.rs
+@@ -82,6 +82,7 @@ impl FfiVideoStream {
+                     handle_id,
+                     new_stream.format.and_then(|_| Some(new_stream.format())),
+                     new_stream.normalize_stride.unwrap_or(true),
++                    new_stream.external_frames.unwrap_or(false),
+                     NativeVideoStream::with_options(rtc_track, options),
+                     self_dropped_rx,
+                     server.watch_handle_dropped(new_stream.track_handle),
+@@ -135,6 +136,7 @@ impl FfiVideoStream {
+         stream_handle: FfiHandleId,
+         dst_type: Option<proto::VideoBufferType>,
+         normalize_stride: bool,
++        external_frames: bool,
+         mut native_stream: NativeVideoStream,
+         mut self_dropped_rx: oneshot::Receiver<()>,
+         mut handle_dropped_rx: oneshot::Receiver<()>,
+@@ -156,13 +158,31 @@ impl FfiVideoStream {
+                     let metadata = frame_metadata_to_proto(frame.frame_metadata);
+                     let timestamp_us = frame.timestamp_us;
+                     let rotation = proto::VideoRotation::from(frame.rotation).into();
+-                    let Ok((buffer, info)) = colorcvt::to_video_buffer_info(frame.buffer, dst_type, normalize_stride) else {
+-                        log::error!("video stream failed to convert video frame to {:?}", dst_type);
+-                        continue;
+-                    };
+-
++                    let external = external_frames
++                        .then(|| frame.buffer.as_native().and_then(|native| native.external_frame()))
++                        .flatten();
+                     let handle_id = server.next_id();
+-                    server.store_handle(handle_id, buffer);
++                    let info = if let Some(external) = external {
++                        // The stored buffer keeps the decoder frame alive until the
++                        // client drops the handle; no pixels leave the decoder.
++                        let info = proto::VideoBufferInfo {
++                            r#type: proto::VideoBufferType::External.into(),
++                            width: frame.buffer.width(),
++                            height: frame.buffer.height(),
++                            data_ptr: external as u64,
++                            stride: None,
++                            components: Vec::new(),
++                        };
++                        server.store_handle(handle_id, frame.buffer);
++                        info
++                    } else {
++                        let Ok((buffer, info)) = colorcvt::to_video_buffer_info(frame.buffer, dst_type, normalize_stride) else {
++                            log::error!("video stream failed to convert video frame to {:?}", dst_type);
++                            continue;
++                        };
++                        server.store_handle(handle_id, buffer);
++                        info
++                    };
+ 
+ 
+                     if let Err(err) = server.send_event(
+@@ -224,6 +244,7 @@ impl FfiVideoStream {
+ 
+         let track_source = request.track_source();
+         let normalize_stride = request.normalize_stride.unwrap_or(true);
++        let external_frames = request.external_frames.unwrap_or(false);
+         let queue_size_frames = request.queue_size_frames.map(|capacity| capacity as usize);
+         let (track_tx, mut track_rx) = mpsc::channel::<Track>(1);
+         let (track_finished_tx, track_finished_rx) = broadcast::channel::<Track>(1);
+@@ -268,6 +289,7 @@ impl FfiVideoStream {
+                         stream_handle,
+                         dst_type,
+                         normalize_stride,
++                        external_frames,
+                         NativeVideoStream::with_options(rtc_track, options),
+                         c_rx,
+                         handle_dropped_rx,
 diff --git a/livekit/src/room/e2ee/manager.rs b/livekit/src/room/e2ee/manager.rs
 index 5ee35cd3..ff3b7c8c 100644
 --- a/livekit/src/room/e2ee/manager.rs
@@ -2115,6 +2319,18 @@ index 09bf854a..b63a55e5 100644
 +        assert!(weak.upgrade().is_none());
      }
  }
+diff --git a/webrtc-sys/build.rs b/webrtc-sys/build.rs
+index adabf9cf..202b52c7 100644
+--- a/webrtc-sys/build.rs
++++ b/webrtc-sys/build.rs
+@@ -88,6 +88,7 @@ fn main() {
+         "src/video_encoder_factory.cpp",
+         "src/passthrough_video_encoder.cpp",
+         "src/video_decoder_factory.cpp",
++        "src/external_video_decoder.cpp",
+         "src/synthetic_audio_device.cpp",
+         "src/adm_proxy.cpp",
+         "src/audio_resampler.cpp",
 diff --git a/webrtc-sys/include/livekit/encoded_reference_continuity.h b/webrtc-sys/include/livekit/encoded_reference_continuity.h
 new file mode 100644
 index 00000000..d71b0f0e
@@ -2197,6 +2413,103 @@ index 40e5fece..f0e7c560 100644
    webrtc::scoped_refptr<webrtc::EncodedImageBuffer> payload_;
    std::shared_ptr<std::atomic<bool>> keyframe_request_flag_;
    std::shared_ptr<EncodedRateControlState> rate_control_state_;
+diff --git a/webrtc-sys/include/livekit/external_video_decoder.h b/webrtc-sys/include/livekit/external_video_decoder.h
+new file mode 100644
+index 00000000..adff581c
+--- /dev/null
++++ b/webrtc-sys/include/livekit/external_video_decoder.h
+@@ -0,0 +1,91 @@
++/*
++ * Copyright 2026 LiveKit, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <memory>
++
++#include "api/video/video_frame_buffer.h"
++#include "api/video_codecs/video_decoder.h"
++
++// C ABI of an application-provided video decoder. The application keeps the
++// table alive for the process lifetime. Every function may be called from any
++// WebRTC decoder thread; one decoder instance is never used concurrently.
++// Layout must match include/livekit/external_video_decoder.h in client-sdk-cpp.
++extern "C" {
++
++#define LK_EXTERNAL_VIDEO_DECODER_ABI 1
++
++enum LkExternalVideoCodec : int32_t {
++  LK_EXTERNAL_VIDEO_CODEC_H264 = 0,
++};
++
++enum LkExternalDecodeResult : int32_t {
++  LK_EXTERNAL_DECODE_FRAME = 0,     // `frame` holds a new reference
++  LK_EXTERNAL_DECODE_NO_FRAME = 1,  // accepted, nothing to show yet
++  LK_EXTERNAL_DECODE_ERROR = 2,     // corrupt or undecodable: request a keyframe
++  LK_EXTERNAL_DECODE_FALLBACK = 3,  // unusable: switch to the built-in decoder
++};
++
++struct LkExternalVideoFrame {
++  void* frame;  // opaque, released with release_frame
++  int32_t width;
++  int32_t height;
++};
++
++struct LkExternalVideoDecoder {
++  uint32_t abi_version;
++  void* user;
++  // Returns null when the codec or the machine is unsupported; the built-in
++  // decoder is used then.
++  void* (*create)(void* user, int32_t codec);
++  void (*destroy)(void* decoder);
++  int32_t (*decode)(void* decoder,
++                    const uint8_t* data,
++                    size_t size,
++                    int32_t keyframe,
++                    LkExternalVideoFrame* out);
++  void (*release_frame)(void* frame);
++  // CPU copy for consumers that did not ask for external frames. Nonzero on
++  // failure.
++  int32_t (*read_i420)(void* frame,
++                       uint8_t* y,
++                       int32_t stride_y,
++                       uint8_t* u,
++                       int32_t stride_u,
++                       uint8_t* v,
++                       int32_t stride_v);
++};
++
++// Null clears the decoder. Affects decoders created after the call.
++void lk_set_external_video_decoder(const LkExternalVideoDecoder* decoder);
++
++}  // extern "C"
++
++namespace livekit_ffi {
++
++const LkExternalVideoDecoder* ExternalVideoDecoder();
++
++// Wraps the application decoder; null when it does not support `codec`.
++std::unique_ptr<webrtc::VideoDecoder> CreateExternalVideoDecoder(
++    int32_t codec);
++
++// The application frame carried by a native buffer of an external decoder, or
++// null for any other buffer.
++void* ExternalFrameOf(const webrtc::VideoFrameBuffer& buffer);
++
++}  // namespace livekit_ffi
 diff --git a/webrtc-sys/include/livekit/peer_connection.h b/webrtc-sys/include/livekit/peer_connection.h
 index 50c545c7..f9df1357 100644
 --- a/webrtc-sys/include/livekit/peer_connection.h
@@ -2248,6 +2561,18 @@ index abf4f5ab..d49ab199 100644
  };
  
  std::shared_ptr<PeerConnectionFactory> create_peer_connection_factory();
+diff --git a/webrtc-sys/include/livekit/video_frame_buffer.h b/webrtc-sys/include/livekit/video_frame_buffer.h
+index cb419fd3..4f09d876 100644
+--- a/webrtc-sys/include/livekit/video_frame_buffer.h
++++ b/webrtc-sys/include/livekit/video_frame_buffer.h
+@@ -222,6 +222,7 @@ std::unique_ptr<NV12Buffer> new_nv12_buffer(int width, int height, int stride_y,
+ 
+ std::unique_ptr<VideoFrameBuffer> new_native_buffer_from_platform_image_buffer(PlatformImageBuffer *buffer);
+ PlatformImageBuffer* native_buffer_to_platform_image_buffer(const std::unique_ptr<VideoFrameBuffer> &);
++size_t native_buffer_external_frame(const std::unique_ptr<VideoFrameBuffer>& buffer);
+ 
+ static const VideoFrameBuffer* yuv_to_vfb(const PlanarYuvBuffer* yuv) {
+   return yuv;
 diff --git a/webrtc-sys/include/livekit/video_track.h b/webrtc-sys/include/livekit/video_track.h
 index 21337794..042ee055 100644
 --- a/webrtc-sys/include/livekit/video_track.h
@@ -2389,6 +2714,206 @@ index 67ed2701..23a3979d 100644
 +        );
      }
  }
+diff --git a/webrtc-sys/src/external_video_decoder.cpp b/webrtc-sys/src/external_video_decoder.cpp
+new file mode 100644
+index 00000000..79dcb9c0
+--- /dev/null
++++ b/webrtc-sys/src/external_video_decoder.cpp
+@@ -0,0 +1,173 @@
++/*
++ * Copyright 2026 LiveKit, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "livekit/external_video_decoder.h"
++
++#include <atomic>
++
++#include "api/make_ref_counted.h"
++#include "api/video/i420_buffer.h"
++#include "api/video/video_frame.h"
++#include "modules/video_coding/include/video_error_codes.h"
++#include "rtc_base/logging.h"
++
++namespace {
++std::atomic<const LkExternalVideoDecoder*> g_decoder{nullptr};
++constexpr char kStorage[] = "livekit-external-decoder";
++}  // namespace
++
++extern "C" void lk_set_external_video_decoder(
++    const LkExternalVideoDecoder* decoder) {
++  if (decoder && decoder->abi_version != LK_EXTERNAL_VIDEO_DECODER_ABI) {
++    RTC_LOG(LS_ERROR) << "External video decoder ABI " << decoder->abi_version
++                      << " is not " << LK_EXTERNAL_VIDEO_DECODER_ABI;
++    decoder = nullptr;
++  }
++  g_decoder.store(decoder);
++}
++
++namespace livekit_ffi {
++namespace {
++
++// Owns one application frame reference; the frame stays on the application's
++// device until the last consumer drops this buffer.
++class ExternalFrameBuffer : public webrtc::VideoFrameBuffer {
++ public:
++  ExternalFrameBuffer(const LkExternalVideoDecoder* decoder,
++                      const LkExternalVideoFrame& frame)
++      : decoder_(decoder), frame_(frame) {}
++  ~ExternalFrameBuffer() override { decoder_->release_frame(frame_.frame); }
++
++  Type type() const override { return Type::kNative; }
++  int width() const override { return frame_.width; }
++  int height() const override { return frame_.height; }
++  std::string storage_representation() const override { return kStorage; }
++  void* frame() const { return frame_.frame; }
++
++  webrtc::scoped_refptr<webrtc::I420BufferInterface> ToI420() override {
++    auto i420 = webrtc::I420Buffer::Create(frame_.width, frame_.height);
++    if (decoder_->read_i420(frame_.frame, i420->MutableDataY(), i420->StrideY(),
++                            i420->MutableDataU(), i420->StrideU(),
++                            i420->MutableDataV(), i420->StrideV()) != 0) {
++      RTC_LOG(LS_WARNING) << "External decoder frame readback failed";
++      webrtc::I420Buffer::SetBlack(i420.get());
++    }
++    return i420;
++  }
++
++ private:
++  const LkExternalVideoDecoder* decoder_;
++  const LkExternalVideoFrame frame_;
++};
++
++class ExternalVideoDecoderAdapter : public webrtc::VideoDecoder {
++ public:
++  ExternalVideoDecoderAdapter(const LkExternalVideoDecoder* decoder,
++                              int32_t codec)
++      : decoder_(decoder), codec_(codec) {}
++  ~ExternalVideoDecoderAdapter() override { Release(); }
++
++  bool Configure(const Settings&) override {
++    Release();
++    instance_ = decoder_->create(decoder_->user, codec_);
++    return instance_ != nullptr;
++  }
++
++  int32_t Decode(const webrtc::EncodedImage& input,
++                 int64_t /*render_time_ms*/) override {
++    if (!instance_ || !callback_) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
++    if (!input.data() || input.size() == 0) return WEBRTC_VIDEO_CODEC_ERROR;
++    LkExternalVideoFrame frame{};
++    const auto result = decoder_->decode(
++        instance_, input.data(), input.size(),
++        input.FrameType() == webrtc::VideoFrameType::kVideoFrameKey, &frame);
++    switch (result) {
++      case LK_EXTERNAL_DECODE_FRAME:
++        break;
++      case LK_EXTERNAL_DECODE_NO_FRAME:
++        return WEBRTC_VIDEO_CODEC_OK;
++      case LK_EXTERNAL_DECODE_FALLBACK:
++        RTC_LOG(LS_WARNING) << "External video decoder requested fallback";
++        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
++      default:
++        return WEBRTC_VIDEO_CODEC_ERROR;
++    }
++    if (!frame.frame) return WEBRTC_VIDEO_CODEC_ERROR;
++    if (frame.width <= 0 || frame.height <= 0) {
++      decoder_->release_frame(frame.frame);
++      return WEBRTC_VIDEO_CODEC_ERROR;
++    }
++    auto decoded =
++        webrtc::VideoFrame::Builder()
++            .set_video_frame_buffer(
++                webrtc::make_ref_counted<ExternalFrameBuffer>(decoder_, frame))
++            .set_rtp_timestamp(input.RtpTimestamp())
++            .set_color_space(input.ColorSpace())
++            .set_rotation(input.rotation())
++            .build();
++    callback_->Decoded(decoded, std::nullopt, std::nullopt);
++    return WEBRTC_VIDEO_CODEC_OK;
++  }
++
++  int32_t RegisterDecodeCompleteCallback(
++      webrtc::DecodedImageCallback* callback) override {
++    callback_ = callback;
++    return WEBRTC_VIDEO_CODEC_OK;
++  }
++
++  int32_t Release() override {
++    if (instance_) decoder_->destroy(instance_);
++    instance_ = nullptr;
++    return WEBRTC_VIDEO_CODEC_OK;
++  }
++
++  DecoderInfo GetDecoderInfo() const override {
++    DecoderInfo info;
++    info.implementation_name = "ExternalHardware";
++    info.is_hardware_accelerated = true;
++    return info;
++  }
++
++  const char* ImplementationName() const override { return "ExternalHardware"; }
++
++ private:
++  const LkExternalVideoDecoder* decoder_;
++  const int32_t codec_;
++  void* instance_ = nullptr;
++  webrtc::DecodedImageCallback* callback_ = nullptr;
++};
++
++}  // namespace
++
++const LkExternalVideoDecoder* ExternalVideoDecoder() {
++  return g_decoder.load();
++}
++
++std::unique_ptr<webrtc::VideoDecoder> CreateExternalVideoDecoder(
++    int32_t codec) {
++  const auto* decoder = g_decoder.load();
++  if (!decoder) return nullptr;
++  return std::make_unique<ExternalVideoDecoderAdapter>(decoder, codec);
++}
++
++void* ExternalFrameOf(const webrtc::VideoFrameBuffer& buffer) {
++  if (buffer.type() != webrtc::VideoFrameBuffer::Type::kNative ||
++      buffer.storage_representation() != kStorage)
++    return nullptr;
++  return static_cast<const ExternalFrameBuffer&>(buffer).frame();
++}
++
++}  // namespace livekit_ffi
+diff --git a/webrtc-sys/src/lib.rs b/webrtc-sys/src/lib.rs
+index d33322f1..3ef31583 100644
+--- a/webrtc-sys/src/lib.rs
++++ b/webrtc-sys/src/lib.rs
+@@ -43,6 +43,16 @@ pub mod video_track;
+ pub mod webrtc;
+ pub mod yuv_helper;
+ 
++/// Application video decoder, see `include/livekit/external_video_decoder.h`.
++pub mod external_video_decoder {
++    extern "C" {
++        /// # Safety
++        /// `decoder` is null or a valid `LkExternalVideoDecoder` that outlives
++        /// every decoder created after this call.
++        pub fn lk_set_external_video_decoder(decoder: *const std::ffi::c_void);
++    }
++}
++
+ pub const MEDIA_TYPE_VIDEO: &str = "video";
+ pub const MEDIA_TYPE_AUDIO: &str = "audio";
+ pub const MEDIA_TYPE_DATA: &str = "data";
 diff --git a/webrtc-sys/src/passthrough_video_encoder.cpp b/webrtc-sys/src/passthrough_video_encoder.cpp
 index cd45b9e3..9d50e638 100644
 --- a/webrtc-sys/src/passthrough_video_encoder.cpp
@@ -2839,6 +3364,81 @@ index e97bed2d..24ae4db9 100644
  }
  
  uint32_t RtpSender::ssrc() const {
+diff --git a/webrtc-sys/src/video_decoder_factory.cpp b/webrtc-sys/src/video_decoder_factory.cpp
+index d22ae70d..676b8e5a 100644
+--- a/webrtc-sys/src/video_decoder_factory.cpp
++++ b/webrtc-sys/src/video_decoder_factory.cpp
+@@ -20,6 +20,8 @@
+ #include "api/environment/environment.h"
+ #include "api/video_codecs/av1_profile.h"
+ #include "api/video_codecs/sdp_video_format.h"
++#include "api/video_codecs/video_decoder_software_fallback_wrapper.h"
++#include "livekit/external_video_decoder.h"
+ #include "livekit/objc_video_factory.h"
+ #include "media/base/media_constants.h"
+ #include "modules/video_coding/codecs/h264/include/h264.h"
+@@ -105,7 +107,7 @@ std::vector<webrtc::SdpVideoFormat> VideoDecoderFactory::GetSupportedFormats()
+   for (const webrtc::SdpVideoFormat& format :
+        webrtc::SupportedVP9DecoderCodecs())
+     formats.push_back(format);
+-  if (internal_h264_decoder_works_) {
++  if (internal_h264_decoder_works_ || ExternalVideoDecoder()) {
+     for (const webrtc::SdpVideoFormat& h264_format :
+          webrtc::SupportedH264DecoderCodecs()) {
+       formats.push_back(h264_format);
+@@ -136,6 +138,16 @@ VideoDecoderFactory::CodecSupport VideoDecoderFactory::QueryCodecSupport(
+ 
+ std::unique_ptr<webrtc::VideoDecoder> VideoDecoderFactory::Create(
+     const webrtc::Environment& env, const webrtc::SdpVideoFormat& format) {
++  // The application decoder comes first; WebRTC's software decoder takes over
++  // when it declines the stream or reports itself unusable.
++  if (absl::EqualsIgnoreCase(format.name, webrtc::kH264CodecName) &&
++      ExternalVideoDecoder()) {
++    auto external = CreateExternalVideoDecoder(LK_EXTERNAL_VIDEO_CODEC_H264);
++    if (!internal_h264_decoder_works_) return external;
++    return webrtc::CreateVideoDecoderSoftwareFallbackWrapper(
++        env, webrtc::H264Decoder::Create(), std::move(external));
++  }
++
+   for (const auto& factory : factories_) {
+     for (const auto& supported_format : factory->GetSupportedFormats()) {
+       if (supported_format.IsSameCodec(format))
+diff --git a/webrtc-sys/src/video_frame_buffer.cpp b/webrtc-sys/src/video_frame_buffer.cpp
+index 13b91cec..b64ffc0a 100644
+--- a/webrtc-sys/src/video_frame_buffer.cpp
++++ b/webrtc-sys/src/video_frame_buffer.cpp
+@@ -17,6 +17,7 @@
+ #include "livekit/video_frame_buffer.h"
+ 
+ #include "api/make_ref_counted.h"
++#include "livekit/external_video_decoder.h"
+ 
+ namespace livekit_ffi {
+ 
+@@ -374,4 +375,9 @@ PlatformImageBuffer* native_buffer_to_platform_image_buffer(
+ 
+ #endif
+ 
++size_t native_buffer_external_frame(
++    const std::unique_ptr<VideoFrameBuffer>& buffer) {
++  return reinterpret_cast<size_t>(ExternalFrameOf(*buffer->get()));
++}
++
+ }  // namespace livekit_ffi
+diff --git a/webrtc-sys/src/video_frame_buffer.rs b/webrtc-sys/src/video_frame_buffer.rs
+index 498f8c05..95933411 100644
+--- a/webrtc-sys/src/video_frame_buffer.rs
++++ b/webrtc-sys/src/video_frame_buffer.rs
+@@ -160,6 +160,9 @@ pub mod ffi {
+             buffer: &UniquePtr<VideoFrameBuffer>,
+         ) -> *mut PlatformImageBuffer;
+ 
++        /// The application frame of an external decoder buffer, or 0.
++        fn native_buffer_external_frame(buffer: &UniquePtr<VideoFrameBuffer>) -> usize;
++
+         unsafe fn yuv_to_vfb(yuv: *const PlanarYuvBuffer) -> *const VideoFrameBuffer;
+         unsafe fn biyuv_to_vfb(yuv: *const BiplanarYuvBuffer) -> *const VideoFrameBuffer;
+         unsafe fn yuv8_to_yuv(yuv8: *const PlanarYuv8Buffer) -> *const PlanarYuvBuffer;
 diff --git a/webrtc-sys/src/video_track.cpp b/webrtc-sys/src/video_track.cpp
 index ba89c298..333a890f 100644
 --- a/webrtc-sys/src/video_track.cpp

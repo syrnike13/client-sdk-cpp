@@ -77,6 +77,10 @@ public:
     /// Preferred pixel format for frames delivered by read(). The FFI layer
     /// converts into this format if supported (e.g., RGBA, BGRA, I420, ...).
     VideoBufferType format{VideoBufferType::RGBA};
+
+    /// Deliver frames of the external decoder (setExternalVideoDecoder) as
+    /// VideoBufferType::External instead of converting them to `format`.
+    bool external_frames{false};
   };
 
   /// Factory: create a VideoStream bound to a specific Track

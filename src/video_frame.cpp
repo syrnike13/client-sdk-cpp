@@ -319,6 +319,18 @@ VideoFrame VideoFrame::fromOwnedInfo(const proto::OwnedVideoBuffer& owned) {
   const int height = static_cast<int>(info.height());
   const VideoBufferType type = fromProto(info.type());
 
+  if (type == VideoBufferType::External) {
+    // No pixels to copy: the FFI handle keeps the decoder frame alive.
+    VideoFrame frame;
+    frame.width_ = width;
+    frame.height_ = height;
+    frame.type_ = type;
+    // NOLINTNEXTLINE(performance-no-int-to-ptr)
+    frame.external_frame_ = reinterpret_cast<void*>(info.data_ptr());
+    frame.external_owner_ = std::make_shared<FfiHandle>(static_cast<std::uintptr_t>(owned.handle().id()));
+    return frame;
+  }
+
   std::vector<std::uint8_t> buffer;
 
   if (info.components_size() > 0) {

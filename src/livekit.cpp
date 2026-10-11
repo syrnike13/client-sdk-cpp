@@ -16,6 +16,8 @@
 
 #include "livekit/livekit.h"
 
+#include <algorithm>
+
 #include "ffi_client.h"
 #include "livekit_ffi.h"
 #include "lk_log.h"
@@ -32,6 +34,11 @@ bool initialize(const LogLevel& level) {
 
 void setExternalVideoDecoder(const LkExternalVideoDecoder* decoder) {
   livekit_ffi_set_external_video_decoder(decoder);
+}
+
+void setAudioPlayoutDelay(std::chrono::milliseconds delay) {
+  livekit_ffi_set_audio_playout_delay(static_cast<std::uint32_t>(std::clamp<std::chrono::milliseconds::rep>(
+      delay.count(), 0, 1000)));
 }
 
 bool isInitialized() { return FfiClient::instance().isInitialized(); }

@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include "livekit/audio_frame.h"
 #include "livekit/audio_processing_module.h"
 #include "livekit/audio_source.h"
@@ -62,5 +64,12 @@ LIVEKIT_API bool initialize(const LogLevel& level = LogLevel::Info);
 ///
 /// After shutdown, you may call initialize() again.
 LIVEKIT_API void shutdown();
+
+/// Delay of remote audio that the application renders itself after the SDK
+/// hands it over (its own buffers and output device), for applications that
+/// disable the SDK's platform playout. WebRTC's audio/video synchronization
+/// subtracts it from the audio playout position, so pictures wait for the
+/// sound actually heard. Process-wide; clamped to 0..1000 ms.
+LIVEKIT_API void setAudioPlayoutDelay(std::chrono::milliseconds delay);
 
 } // namespace livekit

@@ -381,6 +381,10 @@ struct TrackPublishOptions {
   /// Controls how the encoder trades off between resolution and framerate
   /// when bandwidth is constrained. If not set, the server defaults apply.
   std::optional<DegradationPreference> degradation_preference;
+
+  /// Encode a two-channel audio source as stereo Opus. The server then
+  /// negotiates stereo with the publisher and its subscribers.
+  std::optional<bool> stereo;
 };
 
 // ---------------------------------------------------------

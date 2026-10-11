@@ -68,6 +68,20 @@ TEST_F(AudioSourceTest, BufferedIngressTimeoutIsNotReportedAsSuccess) {
   source.clearQueue();
 }
 
+TEST_F(AudioSourceTest, UnbufferedCaptureCompletesInTheCallingThread) {
+  auto source = std::make_shared<AudioSource>(48000, 2, 0);
+  auto track = LocalAudioTrack::createLocalAudioTrack("direct-input", source);
+  FreshAudioStream stream(track);
+  auto input = AudioFrame::create(48000, 2, 480);
+  // No timeout applies: the frame is in the sink when captureFrame returns.
+  source->captureFrame(input, 0);
+  FreshAudioFrame output;
+  EXPECT_EQ(stream.tryRead(output, 1'000'000), FreshAudioReadResult::frame);
+  // Errors surface as the call's own exception, not a later callback.
+  auto partial = AudioFrame::create(48000, 2, 240);
+  EXPECT_THROW(source->captureFrame(partial, 0), std::runtime_error);
+}
+
 TEST_F(AudioSourceTest, FreshSinkBoundsQueueAndPreservesStereo) {
   auto source = std::make_shared<AudioSource>(48000, 2, 0);
   auto track = LocalAudioTrack::createLocalAudioTrack("fresh-input", source);

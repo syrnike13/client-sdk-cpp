@@ -64,6 +64,22 @@ renderer wake stalls. A 30-minute, two-participant application run measured
 p95 scheduled age at most 50 ms and maximum 56.911 ms, with bounded queues and
 no underruns; these are development measurements on one Windows machine.
 
+## Device-pulled playout
+
+Applications with platform playout disabled can call `setExternalAudioPlayout(true)`
+and drive `pullAudioPlayout()` from one device-clocked thread every 10 ms. One pull
+serves all active Rooms: their shared `LkRuntime` owns one PeerConnectionFactory
+and synthetic ADM. Read each active `FreshAudioStream` immediately after the pull.
+No timer advances remote audio in this mode; disable it when the driver exits.
+
+The receive path is synchronous: `AudioTransportImpl::NeedMorePlayData` calls
+`AudioMixerImpl::Mix`, which pulls every receive source, then `ChannelReceive`
+decodes NetEq and calls its raw sink. `RemoteAudioSource::OnData` forwards to
+`NativeAudioSink`, which fills the fresh queue inline on the caller thread.
+A source not yet playing, or a NetEq error, can still produce no frame.
+The Rust `external_playout_delivers_remote_frames_before_return` loopback test
+checks immediate reads, sink thread identity, and internal timer resumption.
+
 ## Publisher replacement regression
 
 The remote-audio routing fixture uncovered a publisher regression with mixed

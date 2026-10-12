@@ -1,3 +1,19 @@
+diff --git a/.changeset/device-pulled-playout.md b/.changeset/device-pulled-playout.md
+new file mode 100644
+index 00000000..47df01f5
+--- /dev/null
++++ b/.changeset/device-pulled-playout.md
+@@ -0,0 +1,10 @@
++---
++webrtc-sys: patch
++libwebrtc: patch
++livekit: patch
++livekit-ffi: patch
++---
++
++Add process-wide external synthetic audio playout: a single application thread
++pulls one 10 ms frame synchronously for all Rooms, instead of the internal timer.
++Disabling external playout resumes the timer.
 diff --git a/.changeset/fresh-audio-ingress.md b/.changeset/fresh-audio-ingress.md
 new file mode 100644
 index 00000000..8c07b23f
@@ -340,10 +356,10 @@ index 6b0d8893..70167e97 100644
          // Buffered path.
 diff --git a/libwebrtc/src/native/fresh_audio_stream.rs b/libwebrtc/src/native/fresh_audio_stream.rs
 new file mode 100644
-index 00000000..5d90f21d
+index 00000000..8dddc7ef
 --- /dev/null
 +++ b/libwebrtc/src/native/fresh_audio_stream.rs
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,509 @@
 +// Copyright 2026 LiveKit, Inc.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -633,6 +649,143 @@ index 00000000..5d90f21d
 +mod tests {
 +    use super::*;
 +
++    #[tokio::test]
++    async fn external_playout_delivers_remote_frames_before_return() {
++        use crate::{
++            audio_frame::AudioFrame, audio_source::native::NativeAudioSource,
++            peer_connection_factory::native::PeerConnectionFactoryExt, prelude::*,
++        };
++        use std::{borrow::Cow, sync::Mutex, thread};
++        use tokio::sync::mpsc;
++        use webrtc_sys::playout_delay::{lk_pull_audio_playout, lk_set_external_audio_playout};
++
++        struct ExternalPlayout;
++        impl Drop for ExternalPlayout {
++            fn drop(&mut self) {
++                // SAFETY: The native mode setter synchronizes ADM lifetime.
++                unsafe { lk_set_external_audio_playout(false) };
++            }
++        }
++        struct ThreadProbe {
++            owner: thread::ThreadId,
++            calls: AtomicU64,
++            wrong_thread: AtomicBool,
++        }
++        impl sys_at::AudioSink for ThreadProbe {
++            fn on_data(&self, _: &[i16], _: i32, _: usize, _: usize) {
++                if thread::current().id() != self.owner {
++                    self.wrong_thread.store(true, Ordering::Relaxed);
++                }
++                self.calls.fetch_add(1, Ordering::Relaxed);
++            }
++        }
++
++        // Run this process-global mode test in isolation from factory tests.
++        // SAFETY: All pulls in this test are on this one owner thread.
++        unsafe { lk_set_external_audio_playout(true) };
++        let _external = ExternalPlayout;
++        let factory = PeerConnectionFactory::default();
++        let publisher = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
++        let receiver = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
++        let source = NativeAudioSource::new(Default::default(), 48_000, 2, 0);
++        let local = factory.create_audio_track("external-playout", source.clone());
++        publisher.add_track(MediaStreamTrack::Audio(local), &["test"]).unwrap();
++        let (publisher_tx, mut publisher_rx) = mpsc::unbounded_channel();
++        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel();
++        publisher.on_ice_candidate(Some(Box::new(move |candidate| {
++            let _ = publisher_tx.send(candidate);
++        })));
++        receiver.on_ice_candidate(Some(Box::new(move |candidate| {
++            let _ = receiver_tx.send(candidate);
++        })));
++        let remote = Arc::new(Mutex::new(None));
++        let received = remote.clone();
++        receiver.on_track(Some(Box::new(move |event| {
++            if let Some(MediaStreamTrack::Audio(track)) = event.receiver.track() {
++                *received.lock().unwrap() = Some(track);
++            }
++        })));
++        tokio::time::timeout(Duration::from_secs(10), async {
++            let offer = publisher.create_offer(OfferOptions::default()).await.unwrap();
++            publisher.set_local_description(offer.clone()).await.unwrap();
++            receiver.set_remote_description(offer).await.unwrap();
++            let answer = receiver.create_answer(AnswerOptions::default()).await.unwrap();
++            receiver.set_local_description(answer.clone()).await.unwrap();
++            publisher.set_remote_description(answer).await.unwrap();
++        })
++        .await
++        .expect("loopback negotiation deadline");
++        let track = remote.lock().unwrap().take().expect("remote audio track");
++        let stream = FreshAudioStream::new(track.clone());
++        let probe = Arc::new(ThreadProbe {
++            owner: thread::current().id(),
++            calls: AtomicU64::new(0),
++            wrong_thread: AtomicBool::new(false),
++        });
++        let sink = sys_at::ffi::new_native_audio_sink(
++            Box::new(sys_at::AudioSinkWrapper::new(probe.clone())),
++            48_000,
++            2,
++        );
++        // SAFETY: The retained remote track is typed audio and outlives the sink.
++        let audio = unsafe { sys_at::ffi::media_to_audio(track.handle.sys_handle()) };
++        audio.add_sink(&sink);
++        let samples = [2_000; FRESH_AUDIO_SAMPLES];
++        let input = AudioFrame {
++            data: Cow::Borrowed(&samples),
++            sample_rate: 48_000,
++            num_channels: 2,
++            samples_per_channel: 480,
++        };
++        let mut verified = 0;
++        let mut heard = false;
++        let deadline = Instant::now() + Duration::from_secs(10);
++        while Instant::now() < deadline && verified < 100 {
++            while let Ok(candidate) = publisher_rx.try_recv() {
++                receiver.add_ice_candidate(candidate).await.unwrap();
++            }
++            while let Ok(candidate) = receiver_rx.try_recv() {
++                publisher.add_ice_candidate(candidate).await.unwrap();
++            }
++            source.capture_frame_direct(&input).unwrap();
++            assert_eq!(stream.stats().queued, 0, "timer produced a frame in external mode");
++            let before = probe.calls.load(Ordering::Relaxed);
++            // SAFETY: External mode is enabled and this is its sole caller thread.
++            let pulled = unsafe { lk_pull_audio_playout() };
++            if probe.calls.load(Ordering::Relaxed) > before {
++                assert!(pulled);
++                assert_eq!(probe.calls.load(Ordering::Relaxed), before + 1);
++                let frame =
++                    stream.try_read(Duration::from_secs(1)).expect("synchronous remote PCM");
++                heard |= frame.samples.iter().any(|sample| *sample > 100 || *sample < -100);
++                assert!(stream.try_read(Duration::from_secs(1)).is_none());
++                verified += 1;
++            }
++            // Pace the simulated device, not a wait for sink delivery.
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++        assert_eq!(verified, 100, "remote receive source never became active");
++        assert!(heard, "loopback delivered only silence");
++        assert!(!probe.wrong_thread.load(Ordering::Relaxed));
++        assert_eq!(stream.stats().dropped, 0);
++        // SAFETY: The mode setter waits for the last synchronous pull.
++        unsafe { lk_set_external_audio_playout(false) };
++        // SAFETY: A disabled driver cannot call through the transport.
++        assert!(!unsafe { lk_pull_audio_playout() });
++        let before = probe.calls.load(Ordering::Relaxed);
++        tokio::time::timeout(Duration::from_secs(1), async {
++            while probe.calls.load(Ordering::Relaxed) == before {
++                tokio::time::sleep(Duration::from_millis(1)).await;
++            }
++        })
++        .await
++        .expect("internal timer did not resume");
++        audio.remove_sink(&sink);
++        drop(stream);
++        publisher.close();
++        receiver.close();
++    }
++
 +    #[test]
 +    fn overrun_stale_and_retirement() {
 +        let queue = FreshAudioQueue::new();
@@ -831,10 +984,10 @@ index 7a4234e3..880e2825 100644
  
      pub trait VideoFrameBufferExt: VideoBuffer {
 diff --git a/livekit-ffi/include/livekit_ffi.h b/livekit-ffi/include/livekit_ffi.h
-index 15f64dfa..bf31c631 100644
+index 15f64dfa..6da08d39 100644
 --- a/livekit-ffi/include/livekit_ffi.h
 +++ b/livekit-ffi/include/livekit_ffi.h
-@@ -37,6 +37,15 @@ FfiHandleId livekit_ffi_request(const uint8_t *data, size_t len,
+@@ -37,6 +37,23 @@ FfiHandleId livekit_ffi_request(const uint8_t *data, size_t len,
  
  bool livekit_ffi_drop_handle(FfiHandleId handle_id);
  
@@ -846,6 +999,14 @@ index 15f64dfa..bf31c631 100644
 + * subtracts it from the audio playout position. Clamped to 1000 ms.
 + */
 +void livekit_ffi_set_audio_playout_delay(uint32_t delay_ms);
++
++/// Enables process-wide application-clocked playout. A single caller must pull
++/// every 10 ms while enabled, or remote audio stalls. Disable to resume the timer.
++void livekit_ffi_set_external_audio_playout(bool enabled);
++
++/// Synchronously pulls one 10 ms frame for all active Rooms; false if not playing
++/// or external playout is disabled. Call from the single playout owner thread.
++bool livekit_ffi_pull_audio_playout();
 +
  } // extern "C"
  
@@ -995,10 +1156,10 @@ index a4b610e0..0e177673 100644
  
  message VideoSourceInfo {
 diff --git a/livekit-ffi/src/cabi.rs b/livekit-ffi/src/cabi.rs
-index d9e83f13..0ea4fa91 100644
+index d9e83f13..4204694a 100644
 --- a/livekit-ffi/src/cabi.rs
 +++ b/livekit-ffi/src/cabi.rs
-@@ -108,6 +108,27 @@ pub extern "C" fn livekit_ffi_drop_handle(handle_id: FfiHandleId) -> bool {
+@@ -108,6 +108,43 @@ pub extern "C" fn livekit_ffi_drop_handle(handle_id: FfiHandleId) -> bool {
      FFI_SERVER.drop_handle(handle_id)
  }
  
@@ -1021,6 +1182,22 @@ index d9e83f13..0ea4fa91 100644
 +#[no_mangle]
 +pub extern "C" fn livekit_ffi_set_audio_playout_delay(delay_ms: u32) {
 +    unsafe { webrtc_sys::playout_delay::lk_set_playout_delay_ms(delay_ms) }
++}
++
++/// Enables process-wide application-clocked playout. A single caller must pull
++/// every 10 ms while enabled, or remote audio stalls. Disable to resume the timer.
++#[no_mangle]
++pub extern "C" fn livekit_ffi_set_external_audio_playout(enabled: bool) {
++    // SAFETY: The native entry point synchronizes mode and ADM lifetime internally.
++    unsafe { webrtc_sys::playout_delay::lk_set_external_audio_playout(enabled) }
++}
++
++/// Synchronously pulls one 10 ms frame for all active Rooms; false if not playing
++/// or external playout is disabled. Call from the single playout owner thread.
++#[no_mangle]
++pub extern "C" fn livekit_ffi_pull_audio_playout() -> bool {
++    // SAFETY: The native entry point guards the ADM through the synchronous pull.
++    unsafe { webrtc_sys::playout_delay::lk_pull_audio_playout() }
 +}
 +
  #[no_mangle]
@@ -1728,6 +1905,27 @@ index f01c754c..d83a61c8 100644
  
          req.packet_trailer_features =
              options.frame_metadata_features.to_proto().into_iter().map(|f| f as i32).collect();
+diff --git a/livekit/src/rtc_engine/lk_runtime.rs b/livekit/src/rtc_engine/lk_runtime.rs
+index e1c77f68..ad9b86b5 100644
+--- a/livekit/src/rtc_engine/lk_runtime.rs
++++ b/livekit/src/rtc_engine/lk_runtime.rs
+@@ -322,7 +322,15 @@ impl LkRuntime {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{LkRuntimeState, WebRtcRuntimeInitializedError};
++    use super::{LkRuntime, LkRuntimeState, WebRtcRuntimeInitializedError};
++
++    #[test]
++    fn active_rooms_share_one_runtime_and_factory() {
++        let first = LkRuntime::instance();
++        let second = LkRuntime::instance();
++        assert!(std::sync::Arc::ptr_eq(&first, &second));
++        assert!(std::ptr::eq(first.pc_factory(), second.pc_factory()));
++    }
+ 
+     #[test]
+     fn zero_playout_delay_can_be_enabled_early_and_repeated() {
 diff --git a/livekit/src/rtc_engine/peer_transport.rs b/livekit/src/rtc_engine/peer_transport.rs
 index 7eccd2ef..0e41446d 100644
 --- a/livekit/src/rtc_engine/peer_transport.rs
@@ -2854,10 +3052,10 @@ index abf4f5ab..d49ab199 100644
  
  std::shared_ptr<PeerConnectionFactory> create_peer_connection_factory();
 diff --git a/webrtc-sys/include/livekit/synthetic_audio_device.h b/webrtc-sys/include/livekit/synthetic_audio_device.h
-index 0d0bb8db..3b31e137 100644
+index 0d0bb8db..dd76d2a3 100644
 --- a/webrtc-sys/include/livekit/synthetic_audio_device.h
 +++ b/webrtc-sys/include/livekit/synthetic_audio_device.h
-@@ -24,6 +24,12 @@
+@@ -24,6 +24,16 @@
  #include "rtc_base/synchronization/mutex.h"
  #include "rtc_base/task_utils/repeating_task.h"
  
@@ -2866,10 +3064,40 @@ index 0d0bb8db..3b31e137 100644
 +// PlayoutDelay, so audio/video synchronization and the playout estimates
 +// account for it. Clamped to 1000 ms; process-wide.
 +extern "C" void lk_set_playout_delay_ms(uint32_t delay_ms);
++// Process-wide single caller: pull one 10 ms frame while enabled, otherwise
++// remote audio stalls. Disabling restores the internal timer.
++extern "C" void lk_set_external_audio_playout(bool enabled);
++extern "C" bool lk_pull_audio_playout();
 +
  namespace livekit_ffi {
  
  class SyntheticAudioDevice : public webrtc::AudioDeviceModule {
+@@ -37,6 +47,8 @@ class SyntheticAudioDevice : public webrtc::AudioDeviceModule {
+   int32_t Init() override;
+   int32_t Terminate() override;
+   bool Initialized() const override;
++  void SetExternalPlayout(bool enabled);
++  bool PullPlayout();
+ 
+   int16_t PlayoutDevices() override;
+   int16_t RecordingDevices() override;
+@@ -117,13 +129,15 @@ class SyntheticAudioDevice : public webrtc::AudioDeviceModule {
+   int32_t SetObserver(webrtc::AudioDeviceObserver* sink) override;
+ 
+  private:
++  bool PullPlayoutLocked();
+   mutable webrtc::Mutex mutex_;
+   std::vector<int16_t> data_;
+   std::unique_ptr<webrtc::TaskQueueBase, webrtc::TaskQueueDeleter> audio_queue_;
+   webrtc::RepeatingTaskHandle audio_task_;
+-  webrtc::AudioTransport* audio_transport_;
++  webrtc::AudioTransport* audio_transport_{nullptr};
+   const webrtc::Environment& env_;
+   bool playing_{false};
+   bool initialized_{false};
++  bool external_playout_{false};
+ };
+ }  // namespace livekit_ffi
 diff --git a/webrtc-sys/include/livekit/video_frame_buffer.h b/webrtc-sys/include/livekit/video_frame_buffer.h
 index cb419fd3..4f09d876 100644
 --- a/webrtc-sys/include/livekit/video_frame_buffer.h
@@ -3203,10 +3431,10 @@ index 00000000..79dcb9c0
 +
 +}  // namespace livekit_ffi
 diff --git a/webrtc-sys/src/lib.rs b/webrtc-sys/src/lib.rs
-index d33322f1..29af5e31 100644
+index d33322f1..8f93e47b 100644
 --- a/webrtc-sys/src/lib.rs
 +++ b/webrtc-sys/src/lib.rs
-@@ -43,6 +43,23 @@ pub mod video_track;
+@@ -43,6 +43,27 @@ pub mod video_track;
  pub mod webrtc;
  pub mod yuv_helper;
  
@@ -3224,6 +3452,10 @@ index d33322f1..29af5e31 100644
 +pub mod playout_delay {
 +    extern "C" {
 +        pub fn lk_set_playout_delay_ms(delay_ms: u32);
++        /// Enables application-clocked playout; one caller must pull every 10 ms.
++        pub fn lk_set_external_audio_playout(enabled: bool);
++        /// Pulls one 10 ms frame synchronously; false when disabled or not playing.
++        pub fn lk_pull_audio_playout() -> bool;
 +    }
 +}
 +
@@ -3681,10 +3913,98 @@ index e97bed2d..24ae4db9 100644
  
  uint32_t RtpSender::ssrc() const {
 diff --git a/webrtc-sys/src/synthetic_audio_device.cpp b/webrtc-sys/src/synthetic_audio_device.cpp
-index 8074b9d9..ec76aef1 100644
+index 8074b9d9..58849cd9 100644
 --- a/webrtc-sys/src/synthetic_audio_device.cpp
 +++ b/webrtc-sys/src/synthetic_audio_device.cpp
-@@ -288,7 +288,12 @@ int32_t SyntheticAudioDevice::StereoRecording(bool* enabled) const {
+@@ -23,6 +23,14 @@ const int kSamplesPer10Ms = kSampleRate / 100;
+ 
+ namespace livekit_ffi {
+ 
++namespace {
++// Lock order is registration then device. Hold registration through a pull so
++// Terminate cannot retire the instance while its transport is being called.
++webrtc::Mutex g_playout_mutex;
++SyntheticAudioDevice* g_playout_device = nullptr;
++bool g_external_playout = false;
++}  // namespace
++
+ SyntheticAudioDevice::SyntheticAudioDevice(const webrtc::Environment& env)
+     : env_(env),
+       data_(kSamplesPer10Ms * kChannels) {}
+@@ -43,6 +51,7 @@ int32_t SyntheticAudioDevice::RegisterAudioCallback(webrtc::AudioTransport* tran
+ }
+ 
+ int32_t SyntheticAudioDevice::Init() {
++  webrtc::MutexLock registration(&g_playout_mutex);
+   webrtc::MutexLock lock(&mutex_);
+   if (initialized_)
+     return 0;
+@@ -55,38 +64,52 @@ int32_t SyntheticAudioDevice::Init() {
+       webrtc::RepeatingTaskHandle::Start(audio_queue_.get(), [this]() {
+         webrtc::MutexLock lock(&mutex_);
+ 
+-        if (playing_) {
+-          int64_t elapsed_time_ms = -1;
+-          int64_t ntp_time_ms = -1;
+-          size_t n_samples_out = 0;
+-          void* data = data_.data();
+-
+-          // Request the AudioData, otherwise WebRTC will ignore the packets.
+-          // 10ms of audio data.
+-          audio_transport_->NeedMorePlayData(
+-              kSamplesPer10Ms, kBytesPerSample, kChannels, kSampleRate, data,
+-              n_samples_out, &elapsed_time_ms, &ntp_time_ms);
+-        }
++        if (!external_playout_) PullPlayoutLocked();
+ 
+         return webrtc::TimeDelta::Millis(10);
+       });
+ 
+   initialized_ = true;
++  external_playout_ = g_external_playout;
++  g_playout_device = this;
+   return 0;
+ }
+ 
+ int32_t SyntheticAudioDevice::Terminate() {
+   {
++    webrtc::MutexLock registration(&g_playout_mutex);
+     webrtc::MutexLock lock(&mutex_);
+     if (!initialized_)
+       return 0;
+ 
+     initialized_ = false;
++    if (g_playout_device == this) g_playout_device = nullptr;
+   }
+   audio_queue_ = nullptr;
+   return 0;
+ }
+ 
++void SyntheticAudioDevice::SetExternalPlayout(bool enabled) {
++  webrtc::MutexLock lock(&mutex_);
++  external_playout_ = enabled;
++}
++
++bool SyntheticAudioDevice::PullPlayout() {
++  webrtc::MutexLock lock(&mutex_);
++  return external_playout_ && PullPlayoutLocked();
++}
++
++bool SyntheticAudioDevice::PullPlayoutLocked() {
++  if (!initialized_ || !playing_ || !audio_transport_) return false;
++  int64_t elapsed_time_ms = -1;
++  int64_t ntp_time_ms = -1;
++  size_t n_samples_out = 0;
++  audio_transport_->NeedMorePlayData(
++      kSamplesPer10Ms, kBytesPerSample, kChannels, kSampleRate, data_.data(),
++      n_samples_out, &elapsed_time_ms, &ntp_time_ms);
++  return true;
++}
++
+ bool SyntheticAudioDevice::Initialized() const {
+   webrtc::MutexLock lock(&mutex_);
+   return initialized_;
+@@ -288,7 +311,12 @@ int32_t SyntheticAudioDevice::StereoRecording(bool* enabled) const {
    return 0;
  }
  
@@ -3697,7 +4017,7 @@ index 8074b9d9..ec76aef1 100644
    return 0;
  }
  
-@@ -333,3 +338,8 @@ int32_t SyntheticAudioDevice::SetObserver(webrtc::AudioDeviceObserver* observer)
+@@ -333,3 +361,21 @@ int32_t SyntheticAudioDevice::SetObserver(webrtc::AudioDeviceObserver* observer)
  }
  
  }  // namespace livekit_ffi
@@ -3705,6 +4025,19 @@ index 8074b9d9..ec76aef1 100644
 +extern "C" void lk_set_playout_delay_ms(uint32_t delay_ms) {
 +  livekit_ffi::g_playout_delay_ms.store(static_cast<uint16_t>(delay_ms > 1000 ? 1000 : delay_ms),
 +                                        std::memory_order_relaxed);
++}
++
++extern "C" void lk_set_external_audio_playout(bool enabled) {
++  webrtc::MutexLock lock(&livekit_ffi::g_playout_mutex);
++  livekit_ffi::g_external_playout = enabled;
++  if (livekit_ffi::g_playout_device)
++    livekit_ffi::g_playout_device->SetExternalPlayout(enabled);
++}
++
++extern "C" bool lk_pull_audio_playout() {
++  webrtc::MutexLock lock(&livekit_ffi::g_playout_mutex);
++  return livekit_ffi::g_playout_device &&
++         livekit_ffi::g_playout_device->PullPlayout();
 +}
 diff --git a/webrtc-sys/src/video_decoder_factory.cpp b/webrtc-sys/src/video_decoder_factory.cpp
 index d22ae70d..676b8e5a 100644

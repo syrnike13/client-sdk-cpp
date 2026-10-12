@@ -72,4 +72,16 @@ LIVEKIT_API void shutdown();
 /// sound actually heard. Process-wide; clamped to 0..1000 ms.
 LIVEKIT_API void setAudioPlayoutDelay(std::chrono::milliseconds delay);
 
+/// @brief Select application-clocked remote audio instead of the internal timer.
+/// Process-wide, for applications that disable SDK platform playout. A single
+/// caller thread must pull every 10 ms while enabled, or remote audio stalls.
+/// @param enabled True to drive playout externally; false to resume the timer.
+LIVEKIT_API void setExternalAudioPlayout(bool enabled);
+
+/// @brief Synchronously pull one 10 ms remote audio frame for all active Rooms.
+/// Track sinks complete on this caller thread before return. Read active
+/// FreshAudioStreams immediately afterwards. Use one caller thread only.
+/// @return True if pulled; false if disabled, uninitialized, or not playing.
+LIVEKIT_API bool pullAudioPlayout();
+
 } // namespace livekit

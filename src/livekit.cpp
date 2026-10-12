@@ -32,14 +32,16 @@ bool initialize(const LogLevel& level) {
   return ffi_client.initialize(false);
 }
 
-void setExternalVideoDecoder(const LkExternalVideoDecoder* decoder) {
-  livekit_ffi_set_external_video_decoder(decoder);
-}
+void setExternalVideoDecoder(const LkExternalVideoDecoder* decoder) { livekit_ffi_set_external_video_decoder(decoder); }
 
 void setAudioPlayoutDelay(std::chrono::milliseconds delay) {
-  livekit_ffi_set_audio_playout_delay(static_cast<std::uint32_t>(std::clamp<std::chrono::milliseconds::rep>(
-      delay.count(), 0, 1000)));
+  livekit_ffi_set_audio_playout_delay(
+      static_cast<std::uint32_t>(std::clamp<std::chrono::milliseconds::rep>(delay.count(), 0, 1000)));
 }
+
+void setExternalAudioPlayout(bool enabled) { livekit_ffi_set_external_audio_playout(enabled); }
+
+bool pullAudioPlayout() { return livekit_ffi_pull_audio_playout(); }
 
 bool isInitialized() { return FfiClient::instance().isInitialized(); }
 

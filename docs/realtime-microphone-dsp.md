@@ -5,15 +5,17 @@ the application fork's microphone stage (#127 in syrnike13/syrnike13-app).
 The existing `AudioProcessingModule` API remains unchanged.
 
 Create, use and destroy one instance on its sole owner thread. Construction
-allocates two independent WebRTC processors and prewarms them with 200 fixed
+allocates three independent WebRTC processors and prewarms them with 200 fixed
 frames. `process` accepts exactly 480 PCM16 mono samples at 48 kHz, an optional
 rendered reference of the same shape, and a bounded 0–500 ms delay. Processing
-applies AEC followed by NS; either processor can be bypassed independently.
+applies AEC followed by NS; each processor can be bypassed independently.
+AGC2 is only available through `processGain`. To preserve gate thresholds,
+measure the post-AEC/NS level, then call `processGain` on that frame.
 Absent reference bypasses AEC without disabling NS. The application owns
-reference freshness, renderer epochs, gate/mute, gain and device/publication
+reference freshness, renderer epochs, gate/mute and device/publication
 lifetime; this class has no Room, device, callback or global FFI handle.
 
-The private native ABI has only create/process/destroy operations. Fixed buffers
+The private native ABI has only create/process/process-gain/destroy operations. Fixed buffers
 and integer errors avoid protobuf requests and error-string allocations in
 ordinary processing. The owner contract forbids concurrent calls. A new echo
 timeline requires a newly prepared instance; there is intentionally no reset

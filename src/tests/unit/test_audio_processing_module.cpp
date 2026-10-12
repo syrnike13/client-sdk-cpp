@@ -897,7 +897,7 @@ TEST_F(AudioProcessingModuleTest, RealtimeBypassAndOwnerContract) {
   EXPECT_EQ(processor.process(samples, nullptr, 501, false, false), RealtimeAudioProcessingResult::invalid_input);
   EXPECT_EQ(samples, original);
   auto result = RealtimeAudioProcessingResult::ok;
-  std::thread other([&] { result = processor.process(samples, nullptr, 0, false, false); });
+  std::thread other([&] { result = processor.processGain(samples); });
   other.join();
   EXPECT_EQ(result, RealtimeAudioProcessingResult::wrong_thread);
   EXPECT_EQ(samples, original);
@@ -949,6 +949,50 @@ TEST_F(AudioProcessingModuleTest, RealtimeSyntheticEcho) {
   }
   const auto erle_db = 10 * std::log10(input_energy / std::max(output_energy, 1.0));
   EXPECT_GE(erle_db, 10.0) << "AEC must suppress the delayed reference independently of NS";
+}
+
+TEST_F(AudioProcessingModuleTest, RealtimeGainRaisesQuietSpeech) {
+  RealtimeAudioProcessing processor;
+  double input_energy = 0;
+  double output_energy = 0;
+  int peak = 0;
+  for (int frame = 0; frame < 600; ++frame) {
+    std::array<std::int16_t, 480> samples{};
+    for (std::size_t index = 0; index < samples.size(); ++index) {
+      const double time = (frame * samples.size() + index) / 48000.0;
+      const double envelope = 0.6 + 0.4 * std::sin(2.0 * M_PI * 3.0 * time);
+      const double voiced = 0.5 * std::sin(2.0 * M_PI * 150.0 * time) + 0.3 * std::sin(2.0 * M_PI * 450.0 * time) +
+                            0.2 * std::sin(2.0 * M_PI * 750.0 * time);
+      samples[index] = static_cast<std::int16_t>(700.0 * envelope * voiced);
+      if (frame >= 400) input_energy += static_cast<double>(samples[index]) * samples[index];
+    }
+    ASSERT_EQ(processor.processGain(samples), RealtimeAudioProcessingResult::ok);
+    for (const auto sample : samples) {
+      peak = std::max(peak, std::abs(static_cast<int>(sample)));
+      if (frame >= 400) output_energy += static_cast<double>(sample) * sample;
+    }
+  }
+  EXPECT_GT(output_energy, input_energy * 4.0) << "AGC2 should raise quiet speech by at least 6 dB after adaptation";
+  EXPECT_LT(peak, 32767) << "AGC2 must not clip the quiet input";
+}
+
+TEST_F(AudioProcessingModuleTest, RealtimeBypassDoesNotAdvanceGain) {
+  RealtimeAudioProcessing gain_only;
+  RealtimeAudioProcessing bypass_then_gain;
+  std::uint32_t seed = 123;
+  for (int frame = 0; frame < 300; ++frame) {
+    std::array<std::int16_t, 480> samples{};
+    for (auto& sample : samples) {
+      seed = seed * 1664525 + 1013904223;
+      sample = static_cast<std::int16_t>(static_cast<int>(seed >> 20) - 2048);
+    }
+    auto bypass_samples = samples;
+    ASSERT_EQ(bypass_then_gain.process(bypass_samples, nullptr, 0, false, false), RealtimeAudioProcessingResult::ok);
+    EXPECT_EQ(bypass_samples, samples) << "AEC/NS bypass must not apply gain";
+    ASSERT_EQ(gain_only.processGain(samples), RealtimeAudioProcessingResult::ok);
+    ASSERT_EQ(bypass_then_gain.processGain(bypass_samples), RealtimeAudioProcessingResult::ok);
+    EXPECT_EQ(bypass_samples, samples) << "AEC/NS processing must not advance AGC2 state";
+  }
 }
 
 } // namespace livekit::test

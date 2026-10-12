@@ -121,6 +121,20 @@ index 00000000..9a1363bb
 +publisher transceiver. Apply the current AddTrack identity only to the offer
 +sent to the SFU, so a later unrelated negotiation does not remove the replacement
 +publication. Transceiver reuse and its resource bound remain enabled.
+diff --git a/.changeset/realtime-agc2.md b/.changeset/realtime-agc2.md
+new file mode 100644
+index 00000000..74933b96
+--- /dev/null
++++ b/.changeset/realtime-agc2.md
+@@ -0,0 +1,8 @@
++---
++livekit-ffi: patch
++---
++
++Add independently prewarmed AGC2 adaptive digital gain to the fixed-frame
++microphone processing seam through a separate gain-only operation, allowing
++gate measurement after AEC and noise suppression without protobuf requests or
++processing-path buffer allocations. The AEC/NS operation has no gain flag.
 diff --git a/.changeset/reused-screen-sender.md b/.changeset/reused-screen-sender.md
 new file mode 100644
 index 00000000..5896d522
@@ -984,10 +998,10 @@ index 7a4234e3..880e2825 100644
  
      pub trait VideoFrameBufferExt: VideoBuffer {
 diff --git a/livekit-ffi/include/livekit_ffi.h b/livekit-ffi/include/livekit_ffi.h
-index 15f64dfa..6da08d39 100644
+index 15f64dfa..3fb1022b 100644
 --- a/livekit-ffi/include/livekit_ffi.h
 +++ b/livekit-ffi/include/livekit_ffi.h
-@@ -37,6 +37,23 @@ FfiHandleId livekit_ffi_request(const uint8_t *data, size_t len,
+@@ -37,6 +37,33 @@ FfiHandleId livekit_ffi_request(const uint8_t *data, size_t len,
  
  bool livekit_ffi_drop_handle(FfiHandleId handle_id);
  
@@ -1007,6 +1021,16 @@ index 15f64dfa..6da08d39 100644
 +/// Synchronously pulls one 10 ms frame for all active Rooms; false if not playing
 +/// or external playout is disabled. Call from the single playout owner thread.
 +bool livekit_ffi_pull_audio_playout();
++
++void *livekit_ffi_realtime_apm_create();
++
++void livekit_ffi_realtime_apm_destroy(void *handle);
++
++int32_t livekit_ffi_realtime_apm_process(void *handle, int16_t *microphone, size_t samples,
++                                       const int16_t *reference, uint32_t delay_ms,
++                                       bool noise_suppression, bool echo_cancellation);
++
++int32_t livekit_ffi_realtime_apm_process_gain(void *handle, int16_t *microphone, size_t samples);
 +
  } // extern "C"
  
@@ -1385,10 +1409,10 @@ index 06695660..87cd8850 100644
  pub mod proto;
 diff --git a/livekit-ffi/src/realtime_apm.rs b/livekit-ffi/src/realtime_apm.rs
 new file mode 100644
-index 00000000..a13fa9f4
+index 00000000..7e5cce40
 --- /dev/null
 +++ b/livekit-ffi/src/realtime_apm.rs
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,223 @@
 +// Copyright 2026 LiveKit, Inc.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -1412,15 +1436,17 @@ index 00000000..a13fa9f4
 +struct RealtimeApm {
 +    echo: AudioProcessingModule,
 +    noise: AudioProcessingModule,
++    gain: AudioProcessingModule,
 +}
 +
-+/// Allocate and prewarm the two independent processors on their future owner.
++/// Allocate and prewarm the three independent processors on their future owner.
 +#[no_mangle]
 +pub extern "C" fn livekit_ffi_realtime_apm_create() -> *mut c_void {
 +    panic::catch_unwind(|| {
 +        let mut apm = Box::new(RealtimeApm {
 +            echo: AudioProcessingModule::new(true, false, false, false),
 +            noise: AudioProcessingModule::new(false, false, false, true),
++            gain: AudioProcessingModule::new(false, true, false, false),
 +        });
 +        let mut reference = [0i16; 480];
 +        let mut microphone = [0i16; 480];
@@ -1435,6 +1461,7 @@ index 00000000..a13fa9f4
 +                || apm.echo.process_10ms(&mut reference, true) != 0
 +                || apm.echo.process_10ms(&mut microphone, false) != 0
 +                || apm.noise.process_10ms(&mut microphone, false) != 0
++                || apm.gain.process_10ms(&mut microphone, false) != 0
 +            {
 +                return ptr::null_mut();
 +            }
@@ -1504,6 +1531,110 @@ index 00000000..a13fa9f4
 +        return 2;
 +    }
 +    0
++}
++
++/// Apply AGC2 to one fixed frame. Returns 0=ok, 1=invalid input, 2=DSP failure.
++///
++/// # Safety
++/// `handle` is a live, exclusively accessed create result. `microphone` points
++/// to exactly 480 writable i16 samples, valid for this synchronous call.
++#[no_mangle]
++pub unsafe extern "C" fn livekit_ffi_realtime_apm_process_gain(
++    handle: *mut c_void,
++    microphone: *mut i16,
++    samples: usize,
++) -> i32 {
++    if handle.is_null()
++        || microphone.is_null()
++        || samples != 480
++        || microphone as usize % align_of::<i16>() != 0
++    {
++        return 1;
++    }
++    // SAFETY: The caller exclusively owns the live handle and writable fixed frame.
++    let apm = unsafe { &mut *handle.cast::<RealtimeApm>() };
++    // SAFETY: Validated dimensions/alignment and exclusive caller-owned storage.
++    let microphone = unsafe { &mut *microphone.cast::<[i16; 480]>() };
++    if apm.gain.process_10ms(microphone, false) != 0 {
++        return 2;
++    }
++    0
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn validates_input_before_processing() {
++        let handle = livekit_ffi_realtime_apm_create();
++        assert!(!handle.is_null());
++        let mut samples = [1234i16; 480];
++        let original = samples;
++        // SAFETY: The handle and frame remain valid and exclusively owned here.
++        unsafe {
++            assert_eq!(
++                livekit_ffi_realtime_apm_process(
++                    handle,
++                    samples.as_mut_ptr(),
++                    479,
++                    ptr::null(),
++                    0,
++                    false,
++                    false,
++                ),
++                1
++            );
++            assert_eq!(samples, original);
++            assert_eq!(
++                livekit_ffi_realtime_apm_process(
++                    handle,
++                    samples.as_mut_ptr(),
++                    480,
++                    ptr::null(),
++                    501,
++                    false,
++                    false,
++                ),
++                1
++            );
++            assert_eq!(samples, original);
++            assert_eq!(
++                livekit_ffi_realtime_apm_process(
++                    handle,
++                    samples.as_mut_ptr(),
++                    480,
++                    ptr::null(),
++                    0,
++                    false,
++                    true,
++                ),
++                0
++            );
++            assert_eq!(samples, original);
++            livekit_ffi_realtime_apm_destroy(handle);
++        }
++    }
++
++    #[test]
++    fn validates_input_before_gain() {
++        let handle = livekit_ffi_realtime_apm_create();
++        assert!(!handle.is_null());
++        let mut samples = [1234i16; 480];
++        let original = samples;
++        // SAFETY: The handle and frame remain valid and exclusively owned here.
++        unsafe {
++            assert_eq!(livekit_ffi_realtime_apm_process_gain(handle, samples.as_mut_ptr(), 479), 1);
++            assert_eq!(
++                livekit_ffi_realtime_apm_process_gain(ptr::null_mut(), samples.as_mut_ptr(), 480),
++                1
++            );
++            assert_eq!(livekit_ffi_realtime_apm_process_gain(handle, ptr::null_mut(), 480), 1);
++            assert_eq!(samples, original);
++            assert_eq!(livekit_ffi_realtime_apm_process_gain(handle, samples.as_mut_ptr(), 480), 0);
++            livekit_ffi_realtime_apm_destroy(handle);
++        }
++    }
 +}
 diff --git a/livekit-ffi/src/server/audio_source.rs b/livekit-ffi/src/server/audio_source.rs
 index fd4f06cf..5c472e20 100644

@@ -28,15 +28,15 @@ namespace livekit {
 /// @brief Result of an exclusively owned fixed-frame DSP operation.
 enum class RealtimeAudioProcessingResult { ok, invalid_input, failed, wrong_thread };
 
-/// @brief Warm, fixed 48 kHz mono microphone AEC/NS, independent of AudioSource.
+/// @brief Warm, fixed 48 kHz mono microphone AEC/NS/AGC2, independent of AudioSource.
 ///
 /// Construct, process and destroy on one owner thread. Construction
-/// allocates and prewarms both processors; ordinary processing uses fixed
-/// buffers and bypasses the protobuf FFI and global handle table. NS and AEC
+/// allocates and prewarms all three processors; ordinary processing uses fixed
+/// buffers and bypasses the protobuf FFI and global handle table. NS, AEC and AGC2
 /// can be enabled independently per frame. No Room or device is owned here.
 class LIVEKIT_API RealtimeAudioProcessing final {
 public:
-  /// @brief Allocate and prewarm the two independent WebRTC processors.
+  /// @brief Allocate and prewarm the three independent WebRTC processors.
   /// @throws std::runtime_error If processor initialization fails.
   RealtimeAudioProcessing();
   /// @brief Release the processors on their owner after processing has stopped.
@@ -55,6 +55,11 @@ public:
                                                       const std::array<std::int16_t, 480>* reference,
                                                       std::uint32_t stream_delay_ms, bool noise_suppression,
                                                       bool echo_cancellation) noexcept;
+
+  /// @brief Apply only AGC2, allowing a gate to measure the frame after AEC/NS.
+  /// @param microphone Exactly 480 writable mono PCM16 samples.
+  /// @return Status under the same owner-thread contract as process().
+  [[nodiscard]] RealtimeAudioProcessingResult processGain(std::array<std::int16_t, 480>& microphone) noexcept;
 
 private:
   struct Deleter {

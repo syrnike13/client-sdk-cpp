@@ -25,6 +25,7 @@ void livekit_ffi_realtime_apm_destroy(void* handle);
 int livekit_ffi_realtime_apm_process(void* handle, std::int16_t* microphone, std::size_t samples,
                                      const std::int16_t* reference, std::uint32_t delay_ms, bool noise_suppression,
                                      bool echo_cancellation);
+int livekit_ffi_realtime_apm_process_gain(void* handle, std::int16_t* microphone, std::size_t samples);
 }
 
 namespace livekit {
@@ -53,5 +54,9 @@ RealtimeAudioProcessingResult RealtimeAudioProcessing::process(std::array<std::i
   return resultOf(livekit_ffi_realtime_apm_process(state_.get(), microphone.data(), microphone.size(),
                                                    reference ? reference->data() : nullptr, stream_delay_ms,
                                                    noise_suppression, echo_cancellation));
+}
+RealtimeAudioProcessingResult RealtimeAudioProcessing::processGain(std::array<std::int16_t, 480>& microphone) noexcept {
+  if (owner_ != std::this_thread::get_id()) return RealtimeAudioProcessingResult::wrong_thread;
+  return resultOf(livekit_ffi_realtime_apm_process_gain(state_.get(), microphone.data(), microphone.size()));
 }
 } // namespace livekit
